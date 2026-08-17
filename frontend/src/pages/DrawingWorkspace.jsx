@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import {
   ZoomIn,
   ZoomOut,
@@ -12,7 +14,8 @@ import {
   Eraser,
   Loader2,
   Plus,
-  Table2
+  Table2,
+  Download
 } from 'lucide-react';
 
 import * as pdfjsLib from 'pdfjs-dist';
@@ -23,6 +26,349 @@ import api from '../services/api';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
+/* =========================================================
+   DETECTION HELPERS (shared by Auto Detect, Add Dimension
+   and balloon drop re-reads)
+========================================================= */
+
+const normalizeDetectionText = (value) =>
+  String(value || '')
+    .replace(/[−–—]/g, '-')
+    .replace(/[＋]/g, '+')
+    .replace(/[Øø]/g, 'Ø')
+    .replace(/(\d),(\d)/g, '$1.$2')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const DETECTION_PATTERNS = {
+  tolerance:
+    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*$/i,
+  bilateral:
+    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*$/i,
+  diameter: /^\s*Ø\s*\d+(?:\.\d+)?\s*$/i,
+  radius: /^\s*R\s*\d+(?:\.\d+)?\s*$/i,
+  dimension:
+    /^\s*\d{1,3}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches))?\s*$/i,
+  smallTolerance: /^\s*[+-±]?\s*0?\.\d{1,3}\s*$/,
+  fit:
+    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
+  angle: /^\s*\d+(?:\.\d+)?\s*°\s*$/,
+  angleTolerance:
+    /^\s*\d+(?:\.\d+)?\s*°\s*±\s*\d+(?:\.\d+)?\s*$/,
+  angularToleranceLine: /^\s*±\s*\d+(?:\.\d+)?\s*°\s*$/,
+  bareFit:
+    /^\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
+  thread:
+    /^\s*M\d+(?:\.\d+)?(?:\s*[x×]\s*\d+(?:\.\d+)?)?\s*$/i,
+  datumFeature: /^\s*\d+(?:\.\d+)?\s*[A-Z]\s*$/
+};
+
+const isDetectionText = (rawText) => {
+  const text = normalizeDetectionText(rawText);
+
+  if (!text) {
+    return false;
+  }
+
+  if (
+    /^(A[0-4]|REV|DATE|DESCRIPTION|WEIGHT|SHEET|SCALE)$/i.test(
+      text
+    )
+  ) {
+    return false;
+  }
+
+  if (/^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}$/.test(text)) {
+    return false;
+  }
+
+  if (/\d+[-_/]\d+[-_/]\d+/.test(text)) {
+    return false;
+  }
+
+  if (/^\d{4,}$/.test(text)) {
+    return false;
+  }
+
+  return (
+    DETECTION_PATTERNS.tolerance.test(text) ||
+    DETECTION_PATTERNS.bilateral.test(text) ||
+    DETECTION_PATTERNS.diameter.test(text) ||
+    DETECTION_PATTERNS.radius.test(text) ||
+    DETECTION_PATTERNS.dimension.test(text) ||
+    DETECTION_PATTERNS.smallTolerance.test(text) ||
+    DETECTION_PATTERNS.fit.test(text) ||
+    DETECTION_PATTERNS.angle.test(text) ||
+    DETECTION_PATTERNS.angleTolerance.test(text) ||
+    DETECTION_PATTERNS.angularToleranceLine.test(text) ||
+    DETECTION_PATTERNS.bareFit.test(text) ||
+    DETECTION_PATTERNS.thread.test(text) ||
+    DETECTION_PATTERNS.datumFeature.test(text)
+  );
+};
+
+const detectionCenterX = (item) =>
+  Number(item.x || 0) + Number(item.width || 0) / 2;
+
+// PDF text y is the BASELINE (bottom), OCR y is the TOP of the box.
+const detectionCenterY = (item) =>
+  item.source === 'ocr'
+    ? Number(item.y || 0) + Number(item.height || 0) / 2
+    : Number(item.y || 0) - Number(item.height || 0) / 2;
+
+/* =========================================================
+   STATUS
+   Green checkmark = Verified (high confidence / selectable text)
+   Orange warning  = Needs verification (OCR low confidence)
+========================================================= */
+
+const statusForDetection = (detected) => {
+  if (!detected) {
+    return 'Draft';
+  }
+
+  if (detected.source === 'pdf') {
+    return 'Verified';
+  }
+
+  return Number(detected.confidence || 0) >= 50
+    ? 'Verified'
+    : 'Needs verification';
+};
+
+/* =========================================================
+   OCR / PDF CLUSTERING
+   ---------------------------------------------------------
+   OCR reads a single dimension callout as separate words
+   (value line + +tolerance line + -tolerance line). Without
+   grouping this becomes 2-3 balloons for ONE dimension.
+
+   clusterDetectionsIntoDimensions merges words that sit
+   close together (stacked value + tolerances) into a single
+   detection so each dimension = ONE balloon.
+========================================================= */
+
+const clusterDetectionsIntoDimensions = (detections) => {
+  if (!detections || detections.length === 0) {
+    return [];
+  }
+
+  const items = detections
+    .map((item) => ({
+      ...item,
+      text: normalizeDetectionText(item.text)
+    }))
+    .filter((item) => item.text);
+
+  const clusterCenterX = (item) =>
+    Number(item.x || 0) +
+    Number(item.width || 0) / 2;
+
+  const clusterCenterY = (item) =>
+    item.source === 'ocr'
+      ? Number(item.y || 0) +
+        Number(item.height || 0) / 2
+      : Number(item.y || 0) -
+        Number(item.height || 0) / 2;
+
+  const isFullToleranceText = (text) =>
+    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*$/i.test(
+      text
+    ) ||
+    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*$/i.test(
+      text
+    );
+
+  const isToleranceLineText = (text) =>
+    /^\s*[+-]?\s*0?\.\d{1,3}\s*$/i.test(text) ||
+    /^\s*±\s*\d+(?:\.\d+)?\s*$/i.test(text) ||
+    /^\s*±\s*\d+(?:\.\d+)?\s*°\s*$/i.test(text) ||
+    /^\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*$/i.test(
+      text
+    );
+
+  const toleranceNumber = (text) => {
+    const match = normalizeDetectionText(text).match(
+      /[+-±]?\s*(\d+(?:\.\d+)?)/
+    );
+
+    return match ? Number(match[1]) : null;
+  };
+
+  /* Cluster items that sit in the same spot. */
+
+  const clusters = [];
+  const used = new Set();
+
+  for (let i = 0; i < items.length; i++) {
+    if (used.has(i)) continue;
+
+    const cluster = [items[i]];
+    used.add(i);
+
+    let grew = true;
+
+    while (grew) {
+      grew = false;
+
+      for (let j = 0; j < items.length; j++) {
+        if (used.has(j)) continue;
+
+        const candidate = items[j];
+        const overlaps = cluster.some((member) => {
+          const dx = Math.abs(
+            clusterCenterX(member) -
+              clusterCenterX(candidate)
+          );
+
+          const dy = Math.abs(
+            clusterCenterY(member) -
+              clusterCenterY(candidate)
+          );
+
+          return dx <= 45 && dy <= 75;
+        });
+
+        if (overlaps) {
+          cluster.push(candidate);
+          used.add(j);
+          grew = true;
+        }
+      }
+    }
+
+    clusters.push(cluster);
+  }
+
+  const result = [];
+
+  for (const cluster of clusters) {
+    const sorted = [...cluster].sort((a, b) => {
+      const aComplete = isFullToleranceText(a.text)
+        ? 0
+        : 1;
+
+      const bComplete = isFullToleranceText(b.text)
+        ? 0
+        : 1;
+
+      if (aComplete !== bComplete) {
+        return aComplete - bComplete;
+      }
+
+      /* The value line is usually the largest text. */
+
+      const aHeight = Number(a.height || 0);
+      const bHeight = Number(b.height || 0);
+
+      if (Math.abs(aHeight - bHeight) > 0.5) {
+        return bHeight - aHeight;
+      }
+
+      return (b.confidence || 0) - (a.confidence || 0);
+    });
+
+    const primary = sorted[0];
+
+    if (!primary) continue;
+
+    let combinedText = primary.text;
+
+    /*
+      Already a complete "25 ±0.05" reading.
+      Skip merging, but still keep any other
+      non-tolerance detections in the cluster.
+    */
+
+    const primaryIsComplete =
+      isFullToleranceText(primary.text);
+
+    if (!primaryIsComplete) {
+      /*
+        Collect tolerance lines that sit with the value.
+        Stacked top-to-bottom: top = plus, bottom = minus.
+      */
+
+      const toleranceLines = sorted
+        .slice(1)
+        .filter((item) =>
+          isToleranceLineText(item.text)
+        )
+        .sort(
+          (a, b) =>
+            clusterCenterY(a) - clusterCenterY(b)
+        )
+        .slice(0, 2);
+
+      if (toleranceLines.length === 1) {
+        const value = toleranceNumber(
+          toleranceLines[0].text
+        );
+
+        if (Number.isFinite(value)) {
+          combinedText =
+            `${primary.text} ±${String(
+              Number(value.toFixed(3))
+            )}`;
+        }
+      } else if (toleranceLines.length >= 2) {
+        const top = toleranceNumber(
+          toleranceLines[0].text
+        );
+
+        const bottom = toleranceNumber(
+          toleranceLines[1].text
+        );
+
+        if (
+          Number.isFinite(top) &&
+          Number.isFinite(bottom)
+        ) {
+          const topHasMinus =
+            /^-/.test(toleranceLines[0].text);
+
+          const bottomHasPlus =
+            /^\+/.test(toleranceLines[1].text);
+
+          if (topHasMinus && bottomHasPlus) {
+            combinedText =
+              `${primary.text} +${String(
+                Number(bottom.toFixed(3))
+              )}/-${String(Number(top.toFixed(3)))}`;
+          } else {
+            combinedText =
+              `${primary.text} +${String(
+                Number(top.toFixed(3))
+              )}/-${String(
+                Number(bottom.toFixed(3))
+              )}`;
+          }
+        }
+      }
+    }
+
+    result.push({
+      ...primary,
+      text: combinedText
+    });
+
+    /*
+      Preserve any other non-tolerance detections in the
+      same cluster (e.g. a fit letter "H7" next to "16", the
+      zero line of a hole callout, or an angle) so they are
+      NOT swallowed by the merge.
+    */
+
+    for (const item of sorted.slice(1)) {
+      if (!isToleranceLineText(item.text)) {
+        result.push(item);
+      }
+    }
+  }
+
+  return result;
+};
+
 export default function DrawingWorkspace() {
   const { id } = useParams();
 
@@ -31,6 +377,17 @@ export default function DrawingWorkspace() {
 
   // Used for dragging balloons
   const dragBalloonRef = useRef(null);
+
+  // Used for the manual "Add Dimension" drag-box selection
+  const selectionRef = useRef(null);
+  const [selection, setSelection] = useState(null);
+
+  // Reused OCR worker + full-page render cache (manual scans)
+  const ocrWorkerRef = useRef(null);
+  const ocrCacheRef = useRef({});
+
+  // Used for the Add Dimension drag-select
+  const addSelectRef = useRef(null);
 
   const [project, setProject] = useState(null);
   const [drawings, setDrawings] = useState([]);
@@ -41,6 +398,9 @@ export default function DrawingWorkspace() {
 
   const [mode, setMode] = useState('none');
   const [selectedBalloonId, setSelectedBalloonId] = useState(null);
+
+  const [addScanning, setAddScanning] = useState(false);
+  const [selectRect, setSelectRect] = useState(null);
 
   const [zoom, setZoom] = useState(1);
   const [renderScale, setRenderScale] = useState(1);
@@ -60,6 +420,14 @@ export default function DrawingWorkspace() {
 
   const [drawingError, setDrawingError] = useState(false);
   const [autoDetecting, setAutoDetecting] = useState(false);
+
+  /*
+    Prevents Auto Detect from running twice on the same
+    drawing. Reset by "Clear All Ballooning" or when the
+    drawing / page changes.
+  */
+
+  const autoDetectDoneRef = useRef(false);
 
   const [savingUnitId, setSavingUnitId] = useState(null);
   const [savingCharacteristicId, setSavingCharacteristicId] = useState(null);
@@ -189,38 +557,52 @@ export default function DrawingWorkspace() {
   ========================================================= */
 
   const displayedBalloons = useMemo(() => {
-    if (balloons.length > 0) {
-      return balloons;
-    }
+    const allBallons = new Map();
+    const firstDrawingId = drawings.length > 0 ? drawings[0]._id : null;
 
-    const seen = new Set();
+    // Add balloons from balloons state
+    (balloons || []).forEach((b) => {
+      const belongsTo = b.drawingId || firstDrawingId;
+      if (belongsTo && belongsTo !== selectedDrawingId) return;
 
-    return characteristics.reduce((acc, entry) => {
-      if (
-        !entry.balloonId ||
-        seen.has(entry.balloonId)
-      ) {
-        return acc;
-      }
-
-      seen.add(entry.balloonId);
-
-      acc.push({
-        _id: entry.balloonId,
-        number: entry.number,
-        x: entry.x,
-        y: entry.y,
-        anchorX: (entry.x || 0) + 25,
-        anchorY: (entry.y || 0) + 25,
-        text: entry.specification,
-        type: entry.type,
-        page: entry.page,
-        status: entry.status || 'Draft'
+      allBallons.set(b._id, {
+        _id: b._id,
+        number: b.number,
+        x: b.x,
+        y: b.y,
+        anchorX: b.anchorX ?? (b.x || 0) + 25,
+        anchorY: b.anchorY ?? (b.y || 0) + 25,
+        text: b.text,
+        type: b.type,
+        page: b.page,
+        status: b.status || 'Draft'
       });
+    });
 
-      return acc;
-    }, []);
-  }, [balloons, characteristics]);
+    // Add/override with characteristics (auto-detect etc.)
+    (characteristics || []).forEach((c) => {
+      const belongsTo = c.drawingId || firstDrawingId;
+      if (belongsTo && belongsTo !== selectedDrawingId) return;
+
+      if (c.balloonId) {
+        const existing = allBallons.get(c.balloonId);
+        allBallons.set(c.balloonId, {
+          _id: c.balloonId,
+          number: c.number,
+          x: existing?.x ?? c.x,
+          y: existing?.y ?? c.y,
+          anchorX: existing?.anchorX ?? c.anchorX ?? (c.x || 0) + 25,
+          anchorY: existing?.anchorY ?? c.anchorY ?? (c.y || 0) + 25,
+          text: c.specification,
+          type: c.type,
+          page: c.page,
+          status: c.status || 'Draft'
+        });
+      }
+    });
+
+    return Array.from(allBallons.values());
+  }, [balloons, characteristics, selectedDrawingId, drawings]);
 
   /* =========================================================
      LOAD PDF
@@ -236,6 +618,7 @@ export default function DrawingWorkspace() {
       setPdfPage(null);
       setPageNumber(1);
       setPageCount(1);
+      autoDetectDoneRef.current = false;
       return;
     }
 
@@ -262,6 +645,7 @@ export default function DrawingWorkspace() {
 
         if (!cancelled) {
           setPdfPage(page);
+          autoDetectDoneRef.current = false;
         }
       } catch (error) {
         console.error(
@@ -313,6 +697,7 @@ export default function DrawingWorkspace() {
 
         if (!cancelled) {
           setPdfPage(page);
+          autoDetectDoneRef.current = false;
         }
       } catch (error) {
         console.error(error);
@@ -386,8 +771,8 @@ export default function DrawingWorkspace() {
     pdfPage.render(renderContext);
   }, [pdfPage, zoom]);
 
-  /* =========================================================
-     SAVE PROJECT
+/* =========================================================
+      SAVE PROJECT
   ========================================================= */
 
   const saveProject = async () => {
@@ -406,41 +791,302 @@ export default function DrawingWorkspace() {
     }
   };
 
-  /* =========================================================
-     MANUAL BALLOON
+/* =========================================================
+      DOWNLOAD PDF WITH BALLOONS
   ========================================================= */
 
-  const createBalloon = async (event) => {
-    if (mode !== 'manual') return;
-
-    if (!pdfPage || !canvasRef.current) {
+  const downloadPdf = async () => {
+    if (!selectedDrawing) {
+      setMessage('No drawing selected');
       return;
     }
 
-    // Do not create a new balloon when clicking an existing balloon
-    if (event.target.closest('.balloon-marker')) {
+    // Check if we have a PDF file path/url
+    const isPdf = selectedDrawing.filePath
+      ? selectedDrawing.filePath.toLowerCase().endsWith('.pdf')
+      : selectedDrawing.url
+        ? selectedDrawing.url.toLowerCase().endsWith('.pdf')
+        : false;
+
+    if (!isPdf) {
+      setMessage('Selected drawing is not a PDF');
       return;
     }
 
-    const canvas = canvasRef.current;
-    const rect = canvas.getBoundingClientRect();
+    if (!pdfPage) {
+      setMessage('PDF not loaded - please wait for the drawing to render');
+      return;
+    }
 
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+    try {
+      setMessage('Generating PDF with balloons...');
 
-    // IMPORTANT: x and y are calculated BEFORE they are used
-    const x = (event.clientX - rect.left) * scaleX;
-    const y = (event.clientY - rect.top) * scaleY;
+      // Original page size in PDF points (1pt = 1/72 inch)
+      const baseViewport = pdfPage.getViewport({ scale: 1 });
 
-    // Place the balloon slightly above-left of where the user clicked,
-    // and point the arrow at the clicked value on the drawing.
-    const balloonX = Math.max(0, x - 28);
-    const balloonY = Math.max(0, y - 28);
+      // The balloon x/y values live in the displayed canvas pixel space.
+      // Re-map them onto the high-resolution export canvas below.
+      let displayScale = 1;
 
-    // Find the highest existing balloon number
+      if (canvasRef.current) {
+        displayScale =
+          canvasRef.current.width /
+          baseViewport.width;
+      }
+
+      // Render the page at high resolution so the downloaded
+      // PDF stays sharp regardless of the current zoom level.
+      const exportScale = 3;
+      const viewport =
+        pdfPage.getViewport({
+          scale: exportScale
+        });
+
+      const exportCanvas =
+        document.createElement('canvas');
+
+      exportCanvas.width =
+        Math.ceil(viewport.width);
+
+      exportCanvas.height =
+        Math.ceil(viewport.height);
+
+      const context =
+        exportCanvas.getContext('2d');
+
+      context.fillStyle = '#ffffff';
+      context.fillRect(
+        0,
+        0,
+        exportCanvas.width,
+        exportCanvas.height
+      );
+
+      await pdfPage.render({
+        canvasContext: context,
+        viewport
+      }).promise;
+
+      const ratio =
+        exportScale / displayScale;
+
+      const pageBalloons =
+        displayedBalloons.filter(
+          (balloon) =>
+            !balloon.page ||
+            balloon.page === pageNumber
+        );
+
+      context.lineCap = 'round';
+      context.lineJoin = 'round';
+
+      for (const balloon of pageBalloons) {
+        const x =
+          (balloon.x ?? 0) * ratio;
+
+        const y =
+          (balloon.y ?? 0) * ratio;
+
+        const ax =
+          (balloon.anchorX ?? x + 25) *
+          ratio;
+
+        const ay =
+          (balloon.anchorY ?? y + 25) *
+          ratio;
+
+        // Direction from the balloon TOWARDS the value
+        const dx = ax - x;
+        const dy = ay - y;
+
+        const dist =
+          Math.hypot(dx, dy) || 1;
+
+        const ux = dx / dist;
+        const uy = dy / dist;
+
+        // Balloon marker radius (matches the 24px on-screen circle)
+        const radius = 12 * ratio;
+        const head = 7 * ratio;
+
+        const startX =
+          x + ux * radius;
+
+        const startY =
+          y + uy * radius;
+
+        // Leader line
+        context.strokeStyle = '#dc2626';
+        context.lineWidth = Math.max(
+          1.5 * ratio,
+          1.5
+        );
+
+        context.beginPath();
+        context.moveTo(startX, startY);
+        context.lineTo(ax, ay);
+        context.stroke();
+
+        // Arrowhead pointing at the measurement
+        const angle =
+          Math.atan2(uy, ux);
+
+        context.fillStyle = '#dc2626';
+        context.beginPath();
+        context.moveTo(ax, ay);
+        context.lineTo(
+          ax -
+            head *
+              Math.cos(angle - 0.35),
+          ay -
+            head *
+              Math.sin(angle - 0.35)
+        );
+        context.lineTo(
+          ax -
+            head *
+              Math.cos(angle + 0.35),
+          ay -
+            head *
+              Math.sin(angle + 0.35)
+        );
+        context.closePath();
+        context.fill();
+
+        // Balloon circle
+        context.fillStyle = '#dc2626';
+        context.beginPath();
+        context.arc(
+          x,
+          y,
+          radius,
+          0,
+          Math.PI * 2
+        );
+        context.fill();
+
+        // Balloon number
+        context.fillStyle = '#ffffff';
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        context.font = `bold ${Math.max(
+          10 * ratio,
+          10
+        )}px sans-serif`;
+
+        context.fillText(
+          String(
+            balloon.number ?? ''
+          ),
+          x,
+          y
+        );
+      }
+
+      // Build a real PDF sized to the original drawing page
+      const pageWidthMm =
+        (baseViewport.width * 25.4) / 72;
+
+      const pageHeightMm =
+        (baseViewport.height * 25.4) / 72;
+
+      const pdf = new jsPDF({
+        orientation:
+          pageWidthMm >= pageHeightMm
+            ? 'landscape'
+            : 'portrait',
+        unit: 'mm',
+        format: [
+          pageWidthMm,
+          pageHeightMm
+        ]
+      });
+
+      const imageData =
+        exportCanvas.toDataURL(
+          'image/png'
+        );
+
+      pdf.addImage(
+        imageData,
+        'PNG',
+        0,
+        0,
+        pageWidthMm,
+        pageHeightMm
+      );
+
+      // Add Characteristics Table as new page
+      pdf.addPage('a4', 'portrait');
+      pdf.setFontSize(16);
+      pdf.setFont('helvetica', 'bold');
+      pdf.text('Characteristics Table', 14, 20);
+
+      // Sort characteristics by balloon number
+      const sortedCharacteristics = [...characteristics].sort(
+        (a, b) => (a.number || 0) - (b.number || 0)
+      );
+
+      const tableData = sortedCharacteristics.map((char) => [
+        String(char.number || ''),
+        String(char.type || 'Dimension'),
+        String(char.specification || ''),
+        String(char.value || ''),
+        String(char.plusTolerance || '0.00'),
+        String(char.minusTolerance || '0.00'),
+        String(char.status || 'Draft')
+      ]);
+
+      autoTable(pdf, {
+        startY: 25,
+        head: [['No.', 'Type', 'Description', 'Dimension No', '+ Tol', '- Tol', 'Status']],
+        body: tableData,
+        theme: 'grid',
+        headStyles: { fillColor: [41, 128, 185], textColor: [255, 255, 255], fontStyle: 'bold' },
+        styles: { fontSize: 10, cellPadding: 3, halign: 'left' },
+        alternateRowStyles: { fillColor: [245, 245, 245] },
+        margin: { top: 20, right: 14, bottom: 20, left: 14 }
+      });
+
+      const downloadName = selectedDrawing.fileName
+        ? selectedDrawing.fileName.replace(
+            /\.[^/.]+$/,
+            '_ballooned.pdf'
+          )
+        : 'ballooned_drawing.pdf';
+
+      pdf.save(downloadName);
+
+      setMessage(
+        'PDF with balloons downloaded successfully'
+      );
+    } catch (error) {
+      console.error(
+        'PDF download error:',
+        error
+      );
+
+      setMessage(
+        error.message ||
+        'Failed to download PDF with balloons'
+      );
+    }
+  };
+
+  /* =========================================================
+     ADD DIMENSION
+     Works like the Lens "Add Dimension" tool:
+     - Toggle with the button or press "A"
+     - Click, or drag a box over a dimension on the drawing
+     - The AI reads the dimension value (PDF text layer, with
+       OCR fallback) and adds a new balloon
+     - The Dimension Editor opens so the value can be verified
+  ========================================================= */
+
+  const getNextBalloonNumber = () => {
     let currentMaxNumber = 0;
 
-    balloons.forEach((balloon) => {
+    displayedBalloons.forEach((balloon) => {
       const number = Number(balloon.number);
 
       if (
@@ -451,61 +1097,101 @@ export default function DrawingWorkspace() {
       }
     });
 
-    characteristics.forEach((characteristic) => {
-      const number = Number(characteristic.number);
+    return currentMaxNumber + 1;
+  };
 
-      if (
-        Number.isFinite(number) &&
-        number > currentMaxNumber
-      ) {
-        currentMaxNumber = number;
-      }
-    });
-
-    // Generate the next balloon number
-    const nextNumber = currentMaxNumber + 1;
+  const addDimensionAtRect = async (rect) => {
+    if (!pdfPage || !canvasRef.current) {
+      return;
+    }
 
     try {
+      setAddScanning(true);
+
+      const scanned =
+        await scanDimensionInRect(rect);
+
+      const centerX =
+        (rect.x1 + rect.x2) / 2;
+
+      const centerY =
+        (rect.y1 + rect.y2) / 2;
+
+      /*
+        Always place a balloon wherever the user drags.
+        If no dimension text could be read, use an empty
+        placeholder they can fill in from the side panel.
+      */
+
+      const detected =
+        scanned || {
+          text: '',
+          value: '',
+          type: 'Dimension',
+          plusTolerance: '0.00',
+          minusTolerance: '0.00',
+          upperLimit: '0.00',
+          lowerLimit: '0.00',
+          specification: 'Dimension',
+          centerX,
+          centerY
+        };
+
+      let anchorX = centerX;
+      let anchorY = centerY;
+      let balloonX = Math.max(0, centerX - 28);
+      let balloonY = Math.max(0, centerY - 28);
+
+      // Point the arrow at the read value and
+      // place the balloon away from it.
+      anchorX = detected.centerX;
+      anchorY = detected.centerY;
+      balloonX = Math.max(0, anchorX + 40);
+      balloonY = Math.max(0, anchorY - 60);
+
+      const nextNumber = getNextBalloonNumber();
+
+      const status = statusForDetection(detected);
+
       const balloon = await api.post(
         `/projects/${id}/balloons`,
         {
+          drawingId: selectedDrawingId,
           x: balloonX,
           y: balloonY,
-          anchorX: x,
-          anchorY: y,
-          text: 'New characteristic',
-          type: 'Dimension',
-
-          // IMPORTANT
+          anchorX,
+          anchorY,
+          text: detected.text,
+          type: detected.type,
           number: nextNumber,
-
           page: pageNumber,
-          status: 'Draft'
+          status
         }
       );
 
       const characteristic = await api.post(
         `/projects/${id}/characteristics`,
         {
+          drawingId: selectedDrawingId,
           balloonId: balloon._id,
           number: nextNumber,
-          type: 'Dimension',
-          value: '0',
+          type: detected.type,
+          value: detected.value,
           unit: 'mm',
-          plusTolerance: '0.00',
-          minusTolerance: '0.00',
-          upperLimit: '0.00',
-          lowerLimit: '0.00',
-          specification: 'New characteristic',
+          plusTolerance: detected.plusTolerance,
+          minusTolerance: detected.minusTolerance,
+          upperLimit: detected.upperLimit,
+          lowerLimit: detected.lowerLimit,
+          specification: detected.specification,
           inspectionMethod: 'Vernier Caliper',
           instrument: '',
           actualValue: '',
           result: 'NOT INSPECTED',
           remarks: '',
           page: pageNumber,
-          x: balloonX,
-          y: balloonY,
-          status: 'Draft'
+          x: anchorX,
+          y: anchorY,
+          status
         }
       );
 
@@ -513,38 +1199,162 @@ export default function DrawingWorkspace() {
         ...prev,
         {
           ...balloon,
-
-          // IMPORTANT
           number: nextNumber,
-
           x: balloonX,
           y: balloonY,
-          page: pageNumber
+          page: pageNumber,
+          drawingId: selectedDrawingId
         }
       ]);
 
       setCharacteristics((prev) => [
         ...prev,
-        characteristic
+        {
+          ...characteristic,
+          number: nextNumber,
+          page: pageNumber,
+          drawingId: selectedDrawingId
+        }
       ]);
 
+      // Opens the Dimension Editor so the value can be verified
       setSelectedBalloonId(balloon._id);
 
       setMessage(
-        `Balloon ${balloon.number} created`
+        scanned
+          ? `Balloon ${nextNumber}: "${detected.specification}" read from the drawing`
+          : `Balloon ${nextNumber} added at that spot. Fill in its value in the side panel.`
       );
-
     } catch (error) {
       console.error(
-        'Manual balloon creation failed:',
+        'Add dimension failed:',
         error
       );
 
       setMessage(
         error.message ||
-        'Unable to create balloon'
+        'Unable to add dimension'
       );
+    } finally {
+      setAddScanning(false);
     }
+  };
+
+  /* Drag-select over a dimension. */
+
+  const clientToCanvasPoint = (event) => {
+    const canvas = canvasRef.current;
+
+    if (!canvas) {
+      return { x: 0, y: 0 };
+    }
+
+    const rect = canvas.getBoundingClientRect();
+
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+
+    return {
+      x: (event.clientX - rect.left) * scaleX,
+      y: (event.clientY - rect.top) * scaleY
+    };
+  };
+
+  const handleAddPointerDown = (event) => {
+    if (
+      mode !== 'manual' ||
+      !canvasRef.current
+    ) {
+      return;
+    }
+
+    if (event.target.closest('.balloon-marker')) {
+      return;
+    }
+
+    const point = clientToCanvasPoint(event);
+
+    addSelectRef.current = {
+      startX: point.x,
+      startY: point.y
+    };
+
+    setSelectRect({
+      x1: point.x,
+      y1: point.y,
+      x2: point.x,
+      y2: point.y
+    });
+
+    event.preventDefault();
+
+    event.currentTarget.setPointerCapture?.(
+      event.pointerId
+    );
+  };
+
+  const handleAddPointerMove = (event) => {
+    if (
+      mode !== 'manual' ||
+      !addSelectRef.current ||
+      !canvasRef.current
+    ) {
+      return;
+    }
+
+    const point = clientToCanvasPoint(event);
+    const start = addSelectRef.current;
+
+    setSelectRect({
+      x1: Math.min(start.startX, point.x),
+      y1: Math.min(start.startY, point.y),
+      x2: Math.max(start.startX, point.x),
+      y2: Math.max(start.startY, point.y)
+    });
+  };
+
+  const handleAddPointerUp = async (event) => {
+    if (
+      mode !== 'manual' ||
+      !addSelectRef.current ||
+      !canvasRef.current
+    ) {
+      return;
+    }
+
+    const start = addSelectRef.current;
+
+    addSelectRef.current = null;
+
+    const point = clientToCanvasPoint(event);
+
+    let rect = {
+      x1: Math.min(start.startX, point.x),
+      y1: Math.min(start.startY, point.y),
+      x2: Math.max(start.startX, point.x),
+      y2: Math.max(start.startY, point.y)
+    };
+
+    setSelectRect(null);
+
+    // A tiny box is treated as a click: scan a small area
+    // around the click point instead.
+    const width = rect.x2 - rect.x1;
+    const height = rect.y2 - rect.y1;
+
+    if (width < 15 && height < 15) {
+      const cx = (rect.x1 + rect.x2) / 2;
+      const cy = (rect.y1 + rect.y2) / 2;
+
+      rect = {
+        x1: cx - 70,
+        y1: cy - 70,
+        x2: cx + 70,
+        y2: cy + 70
+      };
+    }
+
+    await addDimensionAtRect(rect);
   };
   /* =========================================================
      DELETE SINGLE BALLOON
@@ -754,6 +1564,7 @@ export default function DrawingWorkspace() {
       setBalloons([]);
       setCharacteristics([]);
       setSelectedBalloonId(null);
+      autoDetectDoneRef.current = false;
 
       setMessage(
         'All ballooning has been cleared'
@@ -999,28 +1810,14 @@ export default function DrawingWorkspace() {
   ) => {
     event.stopPropagation();
 
-    if (!canvasRef.current) return;
-
-    const canvas =
-      canvasRef.current;
-
-    const rect =
-      canvas.getBoundingClientRect();
-
     setSelectedBalloonId(
       balloon._id
     );
 
     dragBalloonRef.current = {
       balloonId: balloon._id,
-      offsetX:
-        event.clientX -
-        rect.left -
-        balloon.x,
-      offsetY:
-        event.clientY -
-        rect.top -
-        balloon.y
+      lastX: event.clientX,
+      lastY: event.clientY
     };
 
     event.currentTarget.setPointerCapture?.(
@@ -1041,52 +1838,28 @@ export default function DrawingWorkspace() {
     const canvas =
       canvasRef.current;
 
-    const rect =
-      canvas.getBoundingClientRect();
+    const dx = event.clientX - drag.lastX;
+    const dy = event.clientY - drag.lastY;
 
-    let newX =
-      event.clientX -
-      rect.left -
-      drag.offsetX;
-
-    let newY =
-      event.clientY -
-      rect.top -
-      drag.offsetY;
-
-    // Keep balloon inside canvas
-    newX = Math.max(
-      0,
-      Math.min(
-        rect.width,
-        newX
-      )
-    );
-
-    newY = Math.max(
-      0,
-      Math.min(
-        rect.height,
-        newY
-      )
-    );
+    drag.lastX = event.clientX;
+    drag.lastY = event.clientY;
 
     setBalloons((prev) =>
-      prev.map((balloon) =>
-        balloon._id ===
-          drag.balloonId
-          ? {
-            ...balloon,
-            x: newX,
-            y: newY
-            /*
-              The anchor stays at the
-              value, so the arrow keeps
-              pointing at it.
-            */
-          }
-          : balloon
-      )
+      prev.map((balloon) => {
+        if (balloon._id !== drag.balloonId) return balloon;
+
+        let newX = balloon.x + dx;
+        let newY = balloon.y + dy;
+
+        newX = Math.max(0, Math.min(canvas.width, newX));
+        newY = Math.max(0, Math.min(canvas.height, newY));
+
+        return {
+          ...balloon,
+          x: newX,
+          y: newY
+        };
+      })
     );
   };
 
@@ -1121,10 +1894,24 @@ export default function DrawingWorkspace() {
           null;
 
         try {
+          /*
+            Read at the arrow's anchor point (where the
+            balloon is pointing), not at the balloon marker
+            itself, so it picks up the value it points at.
+          */
+
+          const readX =
+            balloon.anchorX ??
+            balloon.x + 25;
+
+          const readY =
+            balloon.anchorY ??
+            balloon.y + 25;
+
           fetchedDimension =
             await readDimensionAtPoint(
-              balloon.x,
-              balloon.y
+              readX,
+              readY
             );
         } catch (readError) {
           console.error(
@@ -1283,19 +2070,19 @@ export default function DrawingWorkspace() {
     };
 
   /* =========================================================
-     RE-READ DIMENSION AT A POINT
-     When a balloon is dragged onto a measurement, the nearest
-     value near the drop point is re-read from the PDF text
-     layer and parsed the same way as Auto Detect, so the
-     characteristic table gets the value automatically.
+     DIMENSION READING (shared by balloon drop + Add Dimension)
+     ---------------------------------------------------------
+     collectDimensionItems  - reads the PDF text layer
+     findNearestDimension   - nearest characteristic to a point
+     parseNearestDimension  - value / tolerances / limits
+     ocrReadRegion          - OCR fallback for scanned drawings
+     scanDimensionInRect    - used by the Add Dimension tool
+     readDimensionAtPoint   - used when a balloon is dropped
   ========================================================= */
 
-  const readDimensionAtPoint = async (
-    pointX,
-    pointY
-  ) => {
+  const collectDimensionItems = async () => {
     if (!pdfPage) {
-      return null;
+      return [];
     }
 
     const baseViewport =
@@ -1311,101 +2098,20 @@ export default function DrawingWorkspace() {
         baseViewport.width;
     }
 
-    const normalizeText = (value) =>
-      String(value || '')
-        .replace(/[−–—]/g, '-')
-        .replace(/[＋]/g, '+')
-        .replace(/[Øø]/g, 'Ø')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const tolerancePattern =
-      /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*$/i;
-
-    const bilateralTolerancePattern =
-      /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*$/i;
-
-    const diameterPattern =
-      /^\s*Ø\s*\d+(?:\.\d+)?\s*$/i;
-
-    const radiusPattern =
-      /^\s*R\s*\d+(?:\.\d+)?\s*$/i;
-
-    const dimensionPattern =
-      /^\s*\d{1,3}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches))?\s*$/i;
-
-    const smallTolerancePattern =
-      /^\s*[+-]?\s*0?\.\d{1,3}\s*$/;
-
-    const isCharacteristicText = (
-      rawText
-    ) => {
-      const text =
-        normalizeText(rawText);
-
-      if (!text) {
-        return false;
-      }
-
-      if (
-        /^(A[0-4]|REV|DATE|DESCRIPTION|WEIGHT|SHEET|SCALE)$/i.test(
-          text
-        )
-      ) {
-        return false;
-      }
-
-      if (
-        /^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}$/.test(
-          text
-        )
-      ) {
-        return false;
-      }
-
-      if (
-        /\d+[-_/]\d+[-_/]\d+/.test(text)
-      ) {
-        return false;
-      }
-
-      if (/^\d{4,}$/.test(text)) {
-        return false;
-      }
-
-      return (
-        tolerancePattern.test(text) ||
-        bilateralTolerancePattern.test(
-          text
-        ) ||
-        diameterPattern.test(text) ||
-        radiusPattern.test(text) ||
-        dimensionPattern.test(text) ||
-        smallTolerancePattern.test(text)
-      );
-    };
-
     const textContent =
       await pdfPage.getTextContent();
 
     const items = [];
 
-    for (
-      const item of textContent.items
-    ) {
-      if (
-        !item.str ||
-        !item.str.trim()
-      ) {
+    for (const item of textContent.items) {
+      if (!item.str || !item.str.trim()) {
         continue;
       }
 
       const text =
-        normalizeText(item.str);
+        normalizeDetectionText(item.str);
 
-      if (
-        !isCharacteristicText(text)
-      ) {
+      if (!isDetectionText(text)) {
         continue;
       }
 
@@ -1415,6 +2121,7 @@ export default function DrawingWorkspace() {
           item.transform?.[5] || 0
         );
 
+      // Ignore title block
       if (
         point[1] >
         baseViewport.height * 0.87
@@ -1422,9 +2129,10 @@ export default function DrawingWorkspace() {
         continue;
       }
 
+      // Ignore top-right revision area
       if (
         point[0] >
-          baseViewport.width * 0.68 &&
+        baseViewport.width * 0.68 &&
         point[1] <
         baseViewport.height * 0.12
       ) {
@@ -1448,60 +2156,57 @@ export default function DrawingWorkspace() {
           Number(item.height || 0) *
           displayScale,
 
+        confidence: 1,
+
         source: 'pdf'
       });
     }
 
-    if (items.length === 0) {
-      return null;
-    }
+    return items;
+  };
 
-    /*
-      PDF text y is the BASELINE (bottom of the
-      text), so the visual center is y - h/2.
-    */
-
-    const centerX = (item) =>
-      item.x + (item.width || 0) / 2;
-
-    const centerY = (item) =>
-      item.y - (item.height || 0) / 2;
-
+  const findNearestDimension = (
+    items,
+    pointX,
+    pointY,
+    maxDistance = 150
+  ) => {
     let nearest = null;
     let nearestDistance = Infinity;
 
     for (const item of items) {
       const dx =
-        centerX(item) - pointX;
+        detectionCenterX(item) - pointX;
 
       const dy =
-        centerY(item) - pointY;
+        detectionCenterY(item) - pointY;
 
       const distance = Math.sqrt(
         dx * dx + dy * dy
       );
 
-      if (
-        distance < nearestDistance
-      ) {
+      if (distance < nearestDistance) {
         nearestDistance = distance;
         nearest = item;
       }
     }
 
-    /*
-      Only reassign when the balloon is dropped
-      close enough to a measurement.
-    */
-
     if (
       !nearest ||
-      nearestDistance > 150
+      nearestDistance > maxDistance
     ) {
       return null;
     }
 
-    const text = nearest.text;
+    return nearest;
+  };
+
+  const parseNearestDimension = (
+    items,
+    nearest
+  ) => {
+    const text =
+      normalizeDetectionText(nearest.text);
 
     let plusTolerance = '0.00';
     let minusTolerance = '0.00';
@@ -1518,39 +2223,26 @@ export default function DrawingWorkspace() {
       );
 
     if (plusMinusMatch) {
-      cleanedValue =
-        plusMinusMatch[1];
-
-      plusTolerance =
-        plusMinusMatch[2];
-
-      minusTolerance =
-        plusMinusMatch[2];
+      cleanedValue = plusMinusMatch[1];
+      plusTolerance = plusMinusMatch[2];
+      minusTolerance = plusMinusMatch[2];
     }
 
     if (bilateralMatch) {
-      cleanedValue =
-        bilateralMatch[1];
-
-      plusTolerance =
-        bilateralMatch[2];
-
-      minusTolerance =
-        bilateralMatch[3];
+      cleanedValue = bilateralMatch[1];
+      plusTolerance = bilateralMatch[2];
+      minusTolerance = bilateralMatch[3];
     }
 
     const diameterMatch =
-      text.match(
-        /Ø\s*(\d+(?:\.\d+)?)/i
-      );
+      text.match(/Ø\s*(\d+(?:\.\d+)?)/i);
 
     if (
       diameterMatch &&
       !plusMinusMatch &&
       !bilateralMatch
     ) {
-      cleanedValue =
-        diameterMatch[1];
+      cleanedValue = diameterMatch[1];
     }
 
     const radiusMatch =
@@ -1578,39 +2270,48 @@ export default function DrawingWorkspace() {
     }
 
     /*
-      Combine a standalone tolerance that sits
-      right next to the value (16 / 0.05 / 0.03).
+      Hole / fit callout such as "25 H7" or "Ø 25 H7/g6".
+      Fall back to the first number.
     */
 
+    if (
+      !plusMinusMatch &&
+      !bilateralMatch &&
+      !diameterMatch &&
+      !radiusMatch &&
+      !numericMatch
+    ) {
+      const firstNumber =
+        text.match(
+          /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)/
+        );
+
+      if (firstNumber) {
+        cleanedValue = firstNumber[1];
+      }
+    }
+
+    // Combine a standalone tolerance that sits right
+    // next to the value (16 / 0.05 / 0.03).
     if (
       !plusMinusMatch &&
       !bilateralMatch
     ) {
       const standaloneTolerances =
-        items.filter(
-          (item) =>
-            smallTolerancePattern.test(
-              item.text
-            )
+        items.filter((item) =>
+          DETECTION_PATTERNS.smallTolerance.test(
+            normalizeDetectionText(item.text)
+          )
         );
 
       const isNearbyTolerance = (
         dimension,
         tolerance
       ) => {
-        const dimensionCenterX =
-          dimension.x +
-          (dimension.width || 0) /
-            2;
-
-        const toleranceCenterX =
-          tolerance.x +
-          (tolerance.width || 0) / 2;
-
         const xDifference =
           Math.abs(
-            dimensionCenterX -
-            toleranceCenterX
+            detectionCenterX(dimension) -
+            detectionCenterX(tolerance)
           );
 
         const yDifference =
@@ -1622,45 +2323,35 @@ export default function DrawingWorkspace() {
         const maxXDistance =
           Math.max(
             45,
-            (dimension.width || 20) *
-              2.5
+            (dimension.width || 20) * 2.5
           );
 
         const maxYDistance =
           Math.max(
             60,
-            (dimension.height || 12) *
-              4
+            (dimension.height || 12) * 4
           );
 
         return (
-          xDifference <=
-            maxXDistance &&
+          xDifference <= maxXDistance &&
           yDifference <= maxYDistance
         );
       };
 
       const nearby = standaloneTolerances
         .filter((tolerance) =>
-          isNearbyTolerance(
-            nearest,
-            tolerance
-          )
+          isNearbyTolerance(nearest, tolerance)
         )
-        .sort(
-          (a, b) => a.y - b.y
-        )
+        .sort((a, b) => a.y - b.y)
         .slice(0, 2);
 
       const getToleranceNumber = (
         toleranceText
       ) => {
         const match =
-          normalizeText(
+          normalizeDetectionText(
             toleranceText
-          ).match(
-            /[+-]?\s*(0?\.\d{1,3})/
-          );
+          ).match(/[+-]?\s*(0?\.\d{1,3})/);
 
         return match
           ? Number(match[1])
@@ -1669,14 +2360,10 @@ export default function DrawingWorkspace() {
 
       if (nearby.length === 1) {
         const toleranceValue =
-          getToleranceNumber(
-            nearby[0].text
-          );
+          getToleranceNumber(nearby[0].text);
 
         if (
-          Number.isFinite(
-            toleranceValue
-          )
+          Number.isFinite(toleranceValue)
         ) {
           plusTolerance =
             toleranceValue.toFixed(3);
@@ -1688,75 +2375,47 @@ export default function DrawingWorkspace() {
 
       if (nearby.length >= 2) {
         const firstValue =
-          getToleranceNumber(
-            nearby[0].text
-          );
+          getToleranceNumber(nearby[0].text);
 
         const secondValue =
-          getToleranceNumber(
-            nearby[1].text
-          );
+          getToleranceNumber(nearby[1].text);
 
         if (
-          Number.isFinite(
-            firstValue
-          ) &&
-          Number.isFinite(
-            secondValue
-          )
+          Number.isFinite(firstValue) &&
+          Number.isFinite(secondValue)
         ) {
           const firstHasPlus =
             /^\+/.test(
-              normalizeText(
-                nearby[0].text
-              )
+              normalizeDetectionText(nearby[0].text)
             );
 
           const firstHasMinus =
             /^-/.test(
-              normalizeText(
-                nearby[0].text
-              )
+              normalizeDetectionText(nearby[0].text)
             );
 
           const secondHasPlus =
             /^\+/.test(
-              normalizeText(
-                nearby[1].text
-              )
+              normalizeDetectionText(nearby[1].text)
             );
 
           const secondHasMinus =
             /^-/.test(
-              normalizeText(
-                nearby[1].text
-              )
+              normalizeDetectionText(nearby[1].text)
             );
 
-          if (
-            firstHasPlus &&
-            secondHasMinus
-          ) {
-            plusTolerance =
-              firstValue.toFixed(3);
-
-            minusTolerance =
-              secondValue.toFixed(3);
+          if (firstHasPlus && secondHasMinus) {
+            plusTolerance = firstValue.toFixed(3);
+            minusTolerance = secondValue.toFixed(3);
           } else if (
             firstHasMinus &&
             secondHasPlus
           ) {
-            plusTolerance =
-              secondValue.toFixed(3);
-
-            minusTolerance =
-              firstValue.toFixed(3);
+            plusTolerance = secondValue.toFixed(3);
+            minusTolerance = firstValue.toFixed(3);
           } else {
-            plusTolerance =
-              firstValue.toFixed(3);
-
-            minusTolerance =
-              secondValue.toFixed(3);
+            plusTolerance = firstValue.toFixed(3);
+            minusTolerance = secondValue.toFixed(3);
           }
         }
       }
@@ -1764,47 +2423,30 @@ export default function DrawingWorkspace() {
 
     let type = 'Dimension';
 
-    if (
-      diameterPattern.test(text)
-    ) {
+    if (/^\s*Ø/.test(text)) {
       type = 'Diameter';
-    } else if (
-      radiusPattern.test(text)
-    ) {
+    } else if (/^\s*R\s*\d/.test(text)) {
       type = 'Radius';
     }
 
     const value = cleanedValue;
 
-    const numericValue =
-      Number(value);
-
-    const plus = Number(
-      plusTolerance
-    );
-
-    const minus = Number(
-      minusTolerance
-    );
+    const numericValue = Number(value);
+    const plus = Number(plusTolerance);
+    const minus = Number(minusTolerance);
 
     let upperLimit = '0.00';
     let lowerLimit = '0.00';
 
-    if (
-      Number.isFinite(numericValue)
-    ) {
+    if (Number.isFinite(numericValue)) {
       upperLimit = (
         numericValue +
-        (Number.isFinite(plus)
-          ? plus
-          : 0)
+        (Number.isFinite(plus) ? plus : 0)
       ).toFixed(3);
 
       lowerLimit = (
         numericValue -
-        (Number.isFinite(minus)
-          ? minus
-          : 0)
+        (Number.isFinite(minus) ? minus : 0)
       ).toFixed(3);
     }
 
@@ -1815,33 +2457,369 @@ export default function DrawingWorkspace() {
       minusTolerance !== '0.00'
     ) {
       specification =
-        plusTolerance ===
-        minusTolerance
+        plusTolerance === minusTolerance
           ? `${value} ±${plusTolerance}`
           : `${value} +${plusTolerance}/-${minusTolerance}`;
     }
 
     return {
       text,
-
       value,
-
       type,
-
       plusTolerance,
-
       minusTolerance,
-
       upperLimit,
-
       lowerLimit,
-
       specification,
-
-      centerX: centerX(nearest),
-
-      centerY: centerY(nearest)
+      centerX: detectionCenterX(nearest),
+      centerY: detectionCenterY(nearest)
     };
+  };
+
+  /* Re-read when a balloon is dropped onto a measurement. */
+
+  const readDimensionAtPoint = async (
+    pointX,
+    pointY
+  ) => {
+    if (!pdfPage) {
+      return null;
+    }
+
+    const items =
+      await collectDimensionItems();
+
+    if (items.length === 0) {
+      return null;
+    }
+
+    const nearest = findNearestDimension(
+      items,
+      pointX,
+      pointY,
+      70
+    );
+
+    if (!nearest) {
+      return null;
+    }
+
+    return parseNearestDimension(
+      items,
+      nearest
+    );
+  };
+
+  /* OCR fallback for scanned drawings without a text layer. */
+
+  const ocrReadRegion = async (rect) => {
+    if (!pdfPage) {
+      return [];
+    }
+
+    try {
+      const baseViewport =
+        pdfPage.getViewport({
+          scale: 1
+        });
+
+      let displayScale = 1;
+
+      if (canvasRef.current) {
+        displayScale =
+          canvasRef.current.width /
+          baseViewport.width;
+      }
+
+      const ocrScale = 2;
+
+      const viewport =
+        pdfPage.getViewport({
+          scale: ocrScale
+        });
+
+      const fullCanvas =
+        document.createElement('canvas');
+
+      fullCanvas.width =
+        Math.ceil(viewport.width);
+
+      fullCanvas.height =
+        Math.ceil(viewport.height);
+
+      const ctx =
+        fullCanvas.getContext('2d');
+
+      ctx.filter =
+        'grayscale(1) contrast(160%) brightness(105%)';
+
+      await pdfPage.render({
+        canvasContext: ctx,
+        viewport
+      }).promise;
+
+      const margin = 60;
+      const ratio = ocrScale / displayScale;
+
+      const sx =
+        Math.max(0, (rect.x1 - margin) * ratio);
+
+      const sy =
+        Math.max(0, (rect.y1 - margin) * ratio);
+
+      const sw =
+        (rect.x2 - rect.x1 + margin * 2) * ratio;
+
+      const sh =
+        (rect.y2 - rect.y1 + margin * 2) * ratio;
+
+      if (sw <= 0 || sh <= 0) {
+        return [];
+      }
+
+      const crop =
+        document.createElement('canvas');
+
+      crop.width = Math.ceil(sw);
+      crop.height = Math.ceil(sh);
+
+      const cropContext = crop.getContext('2d');
+
+      cropContext.drawImage(
+        fullCanvas,
+        sx,
+        sy,
+        sw,
+        sh,
+        0,
+        0,
+        sw,
+        sh
+      );
+
+      if (!ocrWorkerRef.current) {
+        ocrWorkerRef.current = await createWorker('eng');
+      }
+      let { data } = await ocrWorkerRef.current.recognize(crop);
+      let words = data.words.map(w => ({
+        text: w.text,
+        bbox: { x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 },
+        confidence: w.confidence
+      }));
+
+      const hasValidText = words.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')));
+      if (!hasValidText && words.length <= 2) {
+        // Try counter-clockwise rotation (bottom-to-top text)
+        const rotCanvas = document.createElement('canvas');
+        rotCanvas.width = crop.height;
+        rotCanvas.height = crop.width;
+        const rctx = rotCanvas.getContext('2d');
+        rctx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
+        rctx.rotate(-Math.PI / 2);
+        rctx.drawImage(crop, -crop.width / 2, -crop.height / 2);
+        
+        const { data: rotData } = await ocrWorkerRef.current.recognize(rotCanvas);
+        const rotWords = rotData.words.map(w => ({
+          text: w.text,
+          bbox: {
+            x0: crop.width - w.bbox.y1,
+            y0: w.bbox.x0,
+            x1: crop.width - w.bbox.y0,
+            y1: w.bbox.x1
+          },
+          confidence: w.confidence
+        }));
+        
+        if (rotWords.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')))) {
+          words = rotWords;
+        } else {
+          // Try clockwise rotation (top-to-bottom text)
+          const rotCanvas2 = document.createElement('canvas');
+          rotCanvas2.width = crop.height;
+          rotCanvas2.height = crop.width;
+          const rctx2 = rotCanvas2.getContext('2d');
+          rctx2.translate(rotCanvas2.width / 2, rotCanvas2.height / 2);
+          rctx2.rotate(Math.PI / 2);
+          rctx2.drawImage(crop, -crop.width / 2, -crop.height / 2);
+          
+          const { data: rotData2 } = await ocrWorkerRef.current.recognize(rotCanvas2);
+          const rotWords2 = rotData2.words.map(w => ({
+            text: w.text,
+            bbox: {
+              x0: w.bbox.y0,
+              y0: crop.height - w.bbox.x1,
+              x1: w.bbox.y1,
+              y1: crop.height - w.bbox.x0
+            },
+            confidence: w.confidence
+          }));
+          if (rotWords2.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')))) {
+             words = rotWords2;
+          }
+        }
+      }
+
+      const items = [];
+
+      for (const word of words) {
+        if (!word.text || !word.text.trim()) {
+          continue;
+        }
+
+        let text = normalizeDetectionText(
+          word.text
+        )
+          .replace(/O(?=\d)/gi, 'Ø')
+          .replace(/^0(?=\d)/, 'Ø');
+
+        if (!isDetectionText(text)) {
+          continue;
+        }
+
+        const wx = word.bbox?.x0 || 0;
+        const wy = word.bbox?.y0 || 0;
+        const ww =
+          (word.bbox?.x1 - word.bbox?.x0) || 0;
+
+        const wh =
+          (word.bbox?.y1 - word.bbox?.y0) || 0;
+
+        items.push({
+          text,
+
+          x: sx / ratio + wx / ratio,
+          y: sy / ratio + wy / ratio,
+
+          width: ww / ratio,
+          height: wh / ratio,
+
+          confidence:
+            Number(word.confidence || 0),
+
+          source: 'ocr'
+        });
+      }
+
+      return items;
+    } catch (error) {
+      console.error(
+        'Region OCR failed:',
+        error
+      );
+
+      return [];
+    }
+  };
+
+  /* Add Dimension scan: read inside the selected rectangle. */
+
+  const scanDimensionInRect = async (rect) => {
+    if (!pdfPage) {
+      return null;
+    }
+
+    const items =
+      await collectDimensionItems();
+
+    if (items.length > 0) {
+      const centerX =
+        (rect.x1 + rect.x2) / 2;
+
+      const centerY =
+        (rect.y1 + rect.y2) / 2;
+
+      let target = null;
+
+      // Prefer a real dimension value over a lone
+      // tolerance like "0.05" when both sit inside the box.
+      const hasBaseValue = (item) =>
+        !DETECTION_PATTERNS.smallTolerance.test(
+          item.text
+        );
+
+      const inside = items
+        .filter((item) => {
+          const itemX =
+            detectionCenterX(item);
+
+          const itemY =
+            detectionCenterY(item);
+
+          return (
+            itemX >= rect.x1 &&
+            itemX <= rect.x2 &&
+            itemY >= rect.y1 &&
+            itemY <= rect.y2
+          );
+        })
+        .sort((a, b) => {
+          const distanceA = Math.hypot(
+            detectionCenterX(a) - centerX,
+            detectionCenterY(a) - centerY
+          );
+
+          const distanceB = Math.hypot(
+            detectionCenterX(b) - centerX,
+            detectionCenterY(b) - centerY
+          );
+
+          if (
+            hasBaseValue(a) !==
+            hasBaseValue(b)
+          ) {
+            return hasBaseValue(a) ? -1 : 1;
+          }
+
+          return distanceA - distanceB;
+        });
+
+      if (inside.length > 0) {
+        target = inside[0];
+      } else {
+        target = findNearestDimension(
+          items,
+          centerX,
+          centerY,
+          70
+        );
+      }
+
+      if (target) {
+        return {
+          ...parseNearestDimension(items, target),
+          source: 'pdf',
+          confidence: 1
+        };
+      }
+    }
+
+    const ocrItems =
+      await ocrReadRegion(rect);
+
+    if (ocrItems.length > 0) {
+      const centerX =
+        (rect.x1 + rect.x2) / 2;
+
+      const centerY =
+        (rect.y1 + rect.y2) / 2;
+
+      const target = findNearestDimension(
+        ocrItems,
+        centerX,
+        centerY,
+        90
+      );
+
+      if (target) {
+        return {
+          ...parseNearestDimension(ocrItems, target),
+          source: 'ocr',
+          confidence: target.confidence
+        };
+      }
+    }
+
+    return null;
   };
 
   /* =========================================================
@@ -2064,6 +3042,7 @@ export default function DrawingWorkspace() {
         .replace(/[−–—]/g, '-')
         .replace(/[＋]/g, '+')
         .replace(/[Øø]/g, 'Ø')
+        .replace(/(\d),(\d)/g, '$1.$2')
         .replace(/\s+/g, ' ')
         .trim();
 
@@ -2081,7 +3060,7 @@ export default function DrawingWorkspace() {
       return (
         /^±\s*\d+(?:\.\d+)?$/i.test(value) ||
         /^[+]\s*\d+(?:\.\d+)?\s*\/\s*[-]\s*\d+(?:\.\d+)?$/i.test(value) ||
-        /^0?\.\d{1,3}$/i.test(value)
+        /^[+-]?\s*0?\.\d{1,3}$/i.test(value)
       );
     };
 
@@ -2386,6 +3365,13 @@ export default function DrawingWorkspace() {
       return;
     }
 
+    if (autoDetectDoneRef.current) {
+      setMessage(
+        'Detection already complete. Use "Clear All Ballooning" if you want to run it again.'
+      );
+      return;
+    }
+
     try {
       setAutoDetecting(true);
       setMode('auto');
@@ -2413,33 +3399,49 @@ export default function DrawingWorkspace() {
       ========================================================= */
 
       const tolerancePattern =
-        /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const bilateralTolerancePattern =
-        /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+
+      const unilateralTolerancePattern =
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋\-−]\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const diameterPattern =
-        /^\s*Ø\s*\d+(?:\.\d+)?\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:C\/BORE\s*)?Ø\s*\d+(?:\.\d+)?(?:(?:\s*[x×]\s*\d+(?:\.\d+)?)?(?:\s*DP)?)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const radiusPattern =
-        /^\s*R\s*\d+(?:\.\d+)?\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:SR|CR)?\s*R\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const dimensionPattern =
-        /^\s*\d{1,3}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches))?\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?\d+(?:\.\d+)?(?:\s*(?:mm|in|inch|inches))?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+
+      const fitPattern =
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+
+      const anglePattern =
+        /^\s*(?:\d+[Xx*]\s*)?\d+(?:\.\d+)?\s*°\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+
+      const angleTolerancePattern =
+        /^\s*(?:\d+[Xx*]\s*)?\d+(?:\.\d+)?\s*°\s*±\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+
+      const angularToleranceLinePattern =
+        /^\s*±\s*\d+(?:\.\d+)?\s*°\s*$/i;
+
+      const bareFitPattern =
+        /^\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i;
+
+      const threadPattern =
+        /^\s*(?:\d+[Xx*]\s*)?M\d+(?:\.\d+)?(?:\s*[x×]\s*\d+(?:\.\d+)?)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+
+      const datumFeaturePattern =
+        /^\s*\d+(?:\.\d+)?\s*[A-Z]\s*$/i;
 
       /*
         Standalone small tolerance.
-  
-        Examples:
-        0.02
-        0.03
-        0.05
-        0.10
-        +0.05
-        -0.03
       */
       const smallTolerancePattern =
-        /^\s*[+-]?\s*0?\.\d{1,3}\s*$/;
+        /^\s*[+-±]?\s*0?\.\d{1,3}\s*$/;
 
       /* =========================================================
          3. NORMALIZE TEXT
@@ -2450,7 +3452,15 @@ export default function DrawingWorkspace() {
           .replace(/[−–—]/g, '-')
           .replace(/[＋]/g, '+')
           .replace(/[Øø]/g, 'Ø')
+          .replace(/^[OQo](?=\d)/, 'Ø') // Fix O/Q misread as diameter
+          .replace(/^0(?=[1-9])/, 'Ø') // Fix 0 misread as diameter (022 -> Ø22)
+          .replace(/(\d),(\d)/g, '$1.$2')
           .replace(/\s+/g, ' ')
+          .replace(/\s*\.\s*/g, '.') // Remove spaces around decimal
+          .replace(/\s*\+\s*/g, '+') // Remove spaces around plus
+          .replace(/\s*\-\s*/g, '-') // Remove spaces around minus
+          .replace(/\s*±\s*/g, '±') // Remove spaces around plus/minus
+          .replace(/\s*\/\s*/g, '/') // Remove spaces around slash
           .trim();
       };
 
@@ -2516,10 +3526,18 @@ export default function DrawingWorkspace() {
         if (
           tolerancePattern.test(text) ||
           bilateralTolerancePattern.test(text) ||
+          unilateralTolerancePattern.test(text) ||
           diameterPattern.test(text) ||
           radiusPattern.test(text) ||
           dimensionPattern.test(text) ||
-          smallTolerancePattern.test(text)
+          smallTolerancePattern.test(text) ||
+          fitPattern.test(text) ||
+          anglePattern.test(text) ||
+          angleTolerancePattern.test(text) ||
+          angularToleranceLinePattern.test(text) ||
+          bareFitPattern.test(text) ||
+          threadPattern.test(text) ||
+          datumFeaturePattern.test(text)
         ) {
           return true;
         }
@@ -2528,7 +3546,12 @@ export default function DrawingWorkspace() {
       };
 
       /* =========================================================
-         5. READ SELECTABLE PDF TEXT
+         4.5 DETECT GARBLED / CUSTOM-ENCODED FONTS
+         ---------------------------------------------------------
+         Some engineering PDFs use custom font encodings where
+         characters are shifted (e.g. by 29 positions). This makes
+         the PDF text layer unreadable. If we detect this, we skip
+         the text layer entirely and go straight to OCR.
       ========================================================= */
 
       const textContent =
@@ -2536,97 +3559,152 @@ export default function DrawingWorkspace() {
 
       const detected = [];
 
-      for (
-        const item of textContent.items
-      ) {
-        if (
-          !item.str ||
-          !item.str.trim()
-        ) {
-          continue;
+      console.log('=== AUTO-DETECT DEBUG ===');
+      console.log('Total PDF text items:', textContent.items.length);
+
+      const nonEmptyItems = textContent.items.filter(
+        (item) => item.str && item.str.trim()
+      );
+
+      let garbledCount = 0;
+
+      for (const item of nonEmptyItems) {
+        const str = item.str.trim();
+        let controlChars = 0;
+
+        for (let i = 0; i < str.length; i++) {
+          const code = str.charCodeAt(i);
+          // Control characters: ASCII 0-31 (excluding tab=9, newline=10, carriage return=13)
+          if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
+            controlChars++;
+          }
         }
 
-        const text =
-          normalizeText(item.str);
-
-        if (
-          !isCharacteristicText(text)
-        ) {
-          continue;
+        // If more than 30% of the characters in this item are control chars, it's garbled
+        if (controlChars / str.length > 0.3) {
+          garbledCount++;
         }
+      }
 
-        const pdfX =
-          item.transform?.[4] || 0;
+      const isGarbledPDF =
+        nonEmptyItems.length > 0 &&
+        garbledCount / nonEmptyItems.length > 0.4;
 
-        const pdfY =
-          item.transform?.[5] || 0;
+      console.log(
+        'Garbled font check:',
+        garbledCount, 'of', nonEmptyItems.length,
+        'items have control chars. isGarbled =', isGarbledPDF
+      );
 
-        const point =
-          baseViewport.convertToViewportPoint(
-            pdfX,
-            pdfY
-          );
+      /* =========================================================
+         5. READ SELECTABLE PDF TEXT (skip if garbled)
+      ========================================================= */
 
-        const x =
-          point[0] * displayScale;
-
-        const y =
-          point[1] * displayScale;
-
-        /*
-          Ignore title block.
-        */
-
-        if (
-          point[1] >
-          baseViewport.height * 0.87
+      if (!isGarbledPDF) {
+        for (
+          const item of textContent.items
         ) {
-          continue;
+          if (
+            !item.str ||
+            !item.str.trim()
+          ) {
+            continue;
+          }
+
+          const text =
+            normalizeText(item.str);
+
+          const passes = isCharacteristicText(text);
+          if (!passes) {
+            console.log('REJECTED:', JSON.stringify(text));
+            continue;
+          }
+
+          const pdfX =
+            item.transform?.[4] || 0;
+
+          const pdfY =
+            item.transform?.[5] || 0;
+
+          const point =
+            baseViewport.convertToViewportPoint(
+              pdfX,
+              pdfY
+            );
+
+          const x =
+            point[0] * displayScale;
+
+          const y =
+            point[1] * displayScale;
+
+          /*
+            Ignore outer margins (top, left, right 5%) and the large bottom title block (bottom 25%).
+          */
+
+          if (
+            point[1] > baseViewport.height * 0.75 || // Bottom 25% (Title Block)
+            point[1] < baseViewport.height * 0.05 || // Top 5% margin
+            point[0] < baseViewport.width * 0.05 ||  // Left 5% margin
+            point[0] > baseViewport.width * 0.95     // Right 5% margin
+          ) {
+            console.log('REJECTED (outside drawing area):', JSON.stringify(text));
+            continue;
+          }
+
+          /*
+            Ignore top-right revision area.
+          */
+
+          if (
+            point[0] >
+            baseViewport.width * 0.68 &&
+            point[1] <
+            baseViewport.height * 0.12
+          ) {
+            console.log('REJECTED (revision area):', JSON.stringify(text));
+            continue;
+          }
+
+          console.log('ACCEPTED:', JSON.stringify(text), 'at', Math.round(x), Math.round(y));
+
+          detected.push({
+            text,
+            x,
+            y,
+
+            width:
+              Number(item.width || 0) *
+              displayScale,
+
+            height:
+              Number(item.height || 0) *
+              displayScale,
+
+            confidence: 1,
+
+            source: 'pdf'
+          });
         }
-
-        /*
-          Ignore top-right revision area.
-        */
-
-        if (
-          point[0] >
-          baseViewport.width * 0.68 &&
-          point[1] <
-          baseViewport.height * 0.12
-        ) {
-          continue;
-        }
-
-        detected.push({
-          text,
-          x,
-          y,
-
-          width:
-            Number(item.width || 0) *
-            displayScale,
-
-          height:
-            Number(item.height || 0) *
-            displayScale,
-
-          confidence: 1,
-
-          source: 'pdf'
-        });
+      } else {
+        console.log('PDF text layer is garbled (custom font encoding). Skipping to OCR...');
       }
 
       /* =========================================================
          6. REMOVE DUPLICATE / OVERLAPPING DETECTIONS
       ========================================================= */
 
+      console.log('Total ACCEPTED before dedup:', detected.length);
+
       const uniqueDetected =
         cleanAndGroupDetections(
           detected
         );
 
+      console.log('Total after cleanAndGroupDetections:', uniqueDetected.length);
+
       /* =========================================================
-         7. OCR FALLBACK
+         7. OCR FALLBACK (also used when PDF text is garbled)
       ========================================================= */
 
       let finalDetected =
@@ -2636,11 +3714,13 @@ export default function DrawingWorkspace() {
         finalDetected.length === 0
       ) {
         setMessage(
-          'No selectable dimensions found. OCR is reading the drawing...'
+          isGarbledPDF
+            ? 'PDF uses custom font encoding. Running deep-learning OCR for accurate detection...'
+            : 'No selectable dimensions found. OCR is reading the drawing...'
         );
 
         try {
-          const ocrScale = 6;
+          const ocrScale = 1.5;
 
           const ocrViewport =
             pdfPage.getViewport({
@@ -2680,7 +3760,7 @@ export default function DrawingWorkspace() {
           );
 
           ocrContext.filter =
-            'contrast(140%) brightness(110%)';
+            'grayscale(1) contrast(160%) brightness(105%)';
 
           await pdfPage.render({
             canvasContext:
@@ -2689,23 +3769,54 @@ export default function DrawingWorkspace() {
               ocrViewport
           }).promise;
 
-          const imageData =
-            ocrCanvas.toDataURL(
-              'image/png'
-            );
+          if (!ocrWorkerRef.current) {
+            ocrWorkerRef.current = await createWorker('eng');
+          }
+          const { data } = await ocrWorkerRef.current.recognize(ocrCanvas);
+          let words = data.words.map(w => ({
+            text: w.text,
+            bbox: {
+              x0: w.bbox.x0,
+              y0: w.bbox.y0,
+              x1: w.bbox.x1,
+              y1: w.bbox.y1
+            },
+            confidence: w.confidence
+          }));
 
-          const worker =
-            await createWorker('eng');
-
-          const result =
-            await worker.recognize(
-              imageData
-            );
-
-          await worker.terminate();
-
-          const words =
-            result.data.words || [];
+          // Phase 3: Spatial Clustering
+          // Merge OCR bounding boxes that are on the same line and close to each other
+          if (words.length > 0) {
+            words.sort((a, b) => {
+              if (Math.abs(a.bbox.y0 - b.bbox.y0) < 15) {
+                return a.bbox.x0 - b.bbox.x0;
+              }
+              return a.bbox.y0 - b.bbox.y0;
+            });
+            
+            const clusteredWords = [];
+            let currentCluster = { ...words[0], text: words[0].text.trim() };
+            
+            for (let i = 1; i < words.length; i++) {
+              const word = words[i];
+              const yDiff = Math.abs(word.bbox.y0 - currentCluster.bbox.y0);
+              const xGap = word.bbox.x0 - currentCluster.bbox.x1;
+              
+              // If on same line (Y diff < 15px) and close (X gap < 40px)
+              if (yDiff < 15 && xGap < 40 && xGap > -20) {
+                currentCluster.text += ' ' + word.text.trim();
+                currentCluster.bbox.x1 = Math.max(currentCluster.bbox.x1, word.bbox.x1);
+                currentCluster.bbox.y1 = Math.max(currentCluster.bbox.y1, word.bbox.y1);
+                currentCluster.bbox.y0 = Math.min(currentCluster.bbox.y0, word.bbox.y0);
+                currentCluster.confidence = (currentCluster.confidence + word.confidence) / 2;
+              } else {
+                clusteredWords.push(currentCluster);
+                currentCluster = { ...word, text: word.text.trim() };
+              }
+            }
+            clusteredWords.push(currentCluster);
+            words = clusteredWords;
+          }
 
           const ocrDetected = [];
 
@@ -2820,7 +3931,7 @@ export default function DrawingWorkspace() {
           }
 
           finalDetected =
-            removeDuplicateDetections(
+            cleanAndGroupDetections(
               [
                 ...finalDetected,
                 ...ocrDetected
@@ -2874,6 +3985,20 @@ export default function DrawingWorkspace() {
       );
 
       /* =========================================================
+         9.5 CLUSTER WORDS INTO DIMENSIONS
+         ---------------------------------------------------------
+         OCR reads one dimension callout as several separate
+         words (value line + tolerance lines). Merge the words
+         that sit together so each dimension becomes ONE balloon
+         instead of 2-3.
+      ========================================================= */
+
+      finalDetected =
+        clusterDetectionsIntoDimensions(
+          finalDetected
+        );
+
+      /* =========================================================
          10. GROUP DIMENSIONS + TOLERANCES
          ---------------------------------------------------------
          THIS IS THE IMPORTANT NEW PART.
@@ -2899,6 +4024,35 @@ export default function DrawingWorkspace() {
           dimensionPattern.test(text) &&
           !smallTolerancePattern.test(text)
         );
+      };
+
+      const isFit = (text) => {
+        return fitPattern.test(text);
+      };
+
+      const isAngle = (text) => {
+        return (
+          anglePattern.test(text) ||
+          angleTolerancePattern.test(text)
+        );
+      };
+
+      const isAngularToleranceLine = (text) => {
+        return angularToleranceLinePattern.test(
+          text
+        );
+      };
+
+      const isBareFit = (text) => {
+        return bareFitPattern.test(text);
+      };
+
+      const isThread = (text) => {
+        return threadPattern.test(text);
+      };
+
+      const isDatumFeature = (text) => {
+        return datumFeaturePattern.test(text);
       };
 
       const isStandaloneTolerance = (text) => {
@@ -3027,7 +4181,13 @@ export default function DrawingWorkspace() {
           isCombinedTolerance(text) ||
           isDiameter(text) ||
           isRadius(text) ||
-          isNormalDimension(text)
+          isNormalDimension(text) ||
+          isFit(text) ||
+          isAngle(text) ||
+          isAngularToleranceLine(text) ||
+          isBareFit(text) ||
+          isThread(text) ||
+          isDatumFeature(text)
         ) {
           mainDimensions.push({
             ...item,
@@ -3180,6 +4340,29 @@ export default function DrawingWorkspace() {
         ) {
           cleanedValue =
             numericMatch[1];
+        }
+
+        /*
+          Hole / fit callout such as "25 H7" or "Ø 25 H7/g6".
+          Fall back to the first number.
+        */
+
+        if (
+          !plusMinusMatch &&
+          !bilateralMatch &&
+          !numericMatch &&
+          !diameterMatch &&
+          !radiusMatch
+        ) {
+          const firstNumber =
+            text.match(
+              /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)/
+            );
+
+          if (firstNumber) {
+            cleanedValue =
+              firstNumber[1];
+          }
         }
 
         /*
@@ -3434,12 +4617,12 @@ export default function DrawingWorkspace() {
           'Dimension';
 
         if (
-          diameterPattern.test(text)
+          /^\s*Ø/.test(text)
         ) {
           type =
             'Diameter';
         } else if (
-          radiusPattern.test(text)
+          /^\s*R\s*\d/.test(text)
         ) {
           type =
             'Radius';
@@ -3593,31 +4776,11 @@ export default function DrawingWorkspace() {
 
       let currentMaxNumber = 0;
 
-      balloons.forEach(
+      displayedBalloons.forEach(
         (balloon) => {
           const number =
             Number(
               balloon.number
-            );
-
-          if (
-            Number.isFinite(
-              number
-            ) &&
-            number >
-            currentMaxNumber
-          ) {
-            currentMaxNumber =
-              number;
-          }
-        }
-      );
-
-      characteristics.forEach(
-        (characteristic) => {
-          const number =
-            Number(
-              characteristic.number
             );
 
           if (
@@ -3703,6 +4866,18 @@ export default function DrawingWorkspace() {
             valueCenterY -
             arrowDistance;
 
+          /*
+            Detection status:
+            - Selectable PDF text is read exactly => Verified
+            - Low-confidence OCR still needs review
+          */
+
+          const detectionStatus =
+            item.source === 'ocr' &&
+            Number(item.confidence || 0) < 80
+              ? 'Needs verification'
+              : 'Verified';
+
           /* =====================================================
              CREATE BALLOON
           ===================================================== */
@@ -3711,6 +4886,8 @@ export default function DrawingWorkspace() {
             await api.post(
               `/projects/${id}/balloons`,
               {
+                drawingId: selectedDrawingId,
+
                 x:
                   balloonX,
 
@@ -3749,7 +4926,7 @@ export default function DrawingWorkspace() {
                   pageNumber,
 
                 status:
-                  'Draft'
+                  detectionStatus
               }
             );
 
@@ -3761,6 +4938,8 @@ export default function DrawingWorkspace() {
             await api.post(
               `/projects/${id}/characteristics`,
               {
+                drawingId: selectedDrawingId,
+
                 balloonId:
                   balloon._id,
 
@@ -3844,7 +5023,7 @@ export default function DrawingWorkspace() {
                   item.y,
 
                 status:
-                  'Draft'
+                  detectionStatus
               }
             );
 
@@ -3950,6 +5129,7 @@ export default function DrawingWorkspace() {
           'No usable engineering characteristics were detected.'
         );
       } else {
+        autoDetectDoneRef.current = true;
         setMessage(
           `${createdCount} engineering characteristic(s) detected successfully.`
         );
@@ -4001,6 +5181,45 @@ export default function DrawingWorkspace() {
     characteristics
   ]);
 
+  /* =========================================================
+     KEYBOARD SHORTCUT
+     "A" toggles the Add Dimension tool.
+  ========================================================= */
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      const target = event.target;
+
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      if (event.key.toLowerCase() === 'a') {
+        setMode((prev) =>
+          prev === 'manual'
+            ? 'none'
+            : 'manual'
+        );
+      }
+    };
+
+    window.addEventListener(
+      'keydown',
+      onKeyDown
+    );
+
+    return () => {
+      window.removeEventListener(
+        'keydown',
+        onKeyDown
+      );
+    };
+  }, []);
 
   return (
     <div className="space-y-4">
@@ -4030,7 +5249,7 @@ export default function DrawingWorkspace() {
 
         <div className="flex flex-wrap items-center gap-2">
 
-          {/* ADD BALLOON (toggle) */}
+          {/* ADD DIMENSION (toggle, shortcut: A) */}
 
           <button
             className={`rounded border px-3 py-2 text-sm flex items-center gap-1 ${mode === 'manual'
@@ -4047,15 +5266,15 @@ export default function DrawingWorkspace() {
           >
             <Plus size={15} />
             {mode === 'manual'
-              ? 'Add Balloon: ON'
-              : 'Add Balloon'}
+              ? 'Add Dimension: ON'
+              : 'Add Dimension (A)'}
           </button>
 
-          {/* ADD BALLOON HINT */}
+          {/* ADD DIMENSION HINT */}
 
           {mode === 'manual' ? (
             <span className="text-xs text-amber-700">
-              Click the drawing to place a new balloon
+              Click or drag over a dimension to read it
             </span>
           ) : null}
 
@@ -4106,6 +5325,17 @@ export default function DrawingWorkspace() {
               className="inline mr-1"
             />
             Save
+          </button>
+
+
+          {/* DOWNLOAD PDF */}
+
+          <button
+            className="rounded border px-3 py-2 text-sm ml-2"
+            onClick={downloadPdf}
+            disabled={!selectedDrawing}
+          >
+            <Download size={15} className="inline mr-1" /> Download PDF
           </button>
 
           {/* ZOOM IN */}
@@ -4488,8 +5718,19 @@ export default function DrawingWorkspace() {
 
                 <div
                   className="relative bg-white shadow-xl"
-                  onClick={
-                    createBalloon
+                  style={
+                    mode === 'manual'
+                      ? { touchAction: 'none' }
+                      : undefined
+                  }
+                  onPointerDown={
+                    handleAddPointerDown
+                  }
+                  onPointerMove={
+                    handleAddPointerMove
+                  }
+                  onPointerUp={
+                    handleAddPointerUp
                   }
                 >
 
@@ -4665,6 +5906,34 @@ export default function DrawingWorkspace() {
 
                         )
                       )}
+
+                    {/* ADD DIMENSION SELECTION RECTANGLE */}
+
+                    {mode === 'manual' &&
+                    selectRect ? (
+                      <div
+                        className="absolute border-2 border-blue-500 bg-blue-400/20"
+                        style={{
+                          left: selectRect.x1,
+                          top: selectRect.y1,
+                          width:
+                            selectRect.x2 -
+                            selectRect.x1,
+                          height:
+                            selectRect.y2 -
+                            selectRect.y1
+                        }}
+                      />
+                    ) : null}
+
+                    {mode === 'manual' &&
+                    addScanning ? (
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <div className="rounded-lg bg-slate-900/80 px-5 py-4 text-sm text-white shadow">
+                          Reading dimension from drawing...
+                        </div>
+                      </div>
+                    ) : null}
 
                   </div>
 

@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs/promises';
@@ -18,7 +19,7 @@ const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/manufacturing-inspection';
 
 app.use(cors());
-app.use(express.json({ limit: '20mb' }));
+app.use(express.json({ limit: '100mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const storage = multer.diskStorage({
@@ -246,6 +247,33 @@ const ensureSeedData = async () => {
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
+app.post('/api/ocr/detect', async (req, res) => {
+  try {
+    const { imageBase64 } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: 'No image provided' });
+
+    console.log('OCR request received, image size:', imageBase64.length, 'chars');
+
+    // Forward to the persistent Python OCR server
+    const response = await fetch('http://127.0.0.1:5050', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64 })
+    });
+
+    const result = await response.json();
+    console.log('OCR result: ', result.detections?.length || 0, 'detections');
+    res.json(result);
+
+  } catch (error) {
+    console.error('OCR Error:', error);
+    res.status(500).json({ 
+      error: 'OCR server not running. Please start it with: python ocr_service.py', 
+      details: error.message 
+    });
+  }
+});
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (isDbReady()) {
@@ -339,11 +367,6 @@ app.post('/api/projects/:id/drawing', upload.single('drawing'), async (req, res)
     // ==============================
     if (isDbReady()) {
 
-      // Delete old drawing records for this project
-      await Drawing.deleteMany({
-        projectId: projectId
-      });
-
       // Create new drawing
       // IMPORTANT:
       // Do NOT add _id here.
@@ -360,12 +383,6 @@ app.post('/api/projects/:id/drawing', upload.single('drawing'), async (req, res)
     // ==============================
     // FALLBACK MODE
     // ==============================
-
-    // Remove previous drawings for this project
-    fallbackState.drawings =
-      fallbackState.drawings.filter(
-        entry => entry.projectId !== projectId
-      );
 
     // UUID is okay ONLY in fallback memory mode
     const newDrawing = {
