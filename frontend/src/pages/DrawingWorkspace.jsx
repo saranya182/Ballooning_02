@@ -31,14 +31,15 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
    and balloon drop re-reads)
 ========================================================= */
 
-const normalizeDetectionText = (value) =>
-  String(value || '')
+const normalizeDetectionText = (value) => {
+  let val = String(value || '').trim().replace(/\s+/g, ' ');
+  return val
     .replace(/[−–—]/g, '-')
     .replace(/[＋]/g, '+')
     .replace(/[Øø]/g, 'Ø')
-    .replace(/(\d),(\d)/g, '$1.$2')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/^[OQo0]\s*(?=\d)/i, 'Ø') // Converts Q19, O19, 019 to Ø19
+    .replace(/(\d),(\d)/g, '$1.$2');
+};
 
 const DETECTION_PATTERNS = {
   tolerance:
@@ -60,7 +61,8 @@ const DETECTION_PATTERNS = {
     /^\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
   thread:
     /^\s*M\d+(?:\.\d+)?(?:\s*[x×]\s*\d+(?:\.\d+)?)?\s*$/i,
-  datumFeature: /^\s*\d+(?:\.\d+)?\s*[A-Z]\s*$/
+  datumFeature: /^\s*\d+(?:\.\d+)?\s*[A-Z]\s*$/,
+  symbol: /^\s*(Ø|R|SØ|SR|M|∅|Q|O|o|0)\s*$/i
 };
 
 const isDetectionText = (rawText) => {
@@ -103,7 +105,8 @@ const isDetectionText = (rawText) => {
     DETECTION_PATTERNS.angularToleranceLine.test(text) ||
     DETECTION_PATTERNS.bareFit.test(text) ||
     DETECTION_PATTERNS.thread.test(text) ||
-    DETECTION_PATTERNS.datumFeature.test(text)
+    DETECTION_PATTERNS.datumFeature.test(text) ||
+    DETECTION_PATTERNS.symbol.test(text)
   );
 };
 
@@ -1033,13 +1036,12 @@ export default function DrawingWorkspace() {
         String(char.specification || ''),
         String(char.value || ''),
         String(char.plusTolerance || '0.00'),
-        String(char.minusTolerance || '0.00'),
-        String(char.status || 'Draft')
+        String(char.minusTolerance || '0.00')
       ]);
 
       autoTable(pdf, {
         startY: 25,
-        head: [['No.', 'Type', 'Description', 'Dimension No', '+ Tol', '- Tol', 'Status']],
+        head: [['No.', 'Type', 'Description', 'Dimension No', '+ Tol', '- Tol']],
         body: tableData,
         theme: 'grid',
         headStyles: { fillColor: [41, 128, 185], textColor: [255, 255, 255], fontStyle: 'bold' },
@@ -2205,8 +2207,19 @@ export default function DrawingWorkspace() {
     items,
     nearest
   ) => {
-    const text =
+    let text =
       normalizeDetectionText(nearest.text);
+
+    const standaloneSymbols = items.filter(item => DETECTION_PATTERNS.symbol.test(normalizeDetectionText(item.text)));
+    const nearbySymbols = standaloneSymbols.filter(sym => {
+      const xDiff = nearest.x - sym.x; 
+      const yDiff = Math.abs(nearest.y - sym.y);
+      return xDiff > -20 && xDiff < (nearest.width || 30) * 3 && yDiff < 30;
+    });
+    
+    if (nearbySymbols.length > 0) {
+      text = normalizeDetectionText(nearbySymbols[0].text + text);
+    }
 
     let plusTolerance = '0.00';
     let minusTolerance = '0.00';
@@ -2346,12 +2359,25 @@ export default function DrawingWorkspace() {
         .slice(0, 2);
 
       const getToleranceNumber = (
-        toleranceText
+        targetItem
       ) => {
-        const match =
+        let text =
           normalizeDetectionText(
-            toleranceText
-          ).match(/[+-]?\s*(0?\.\d{1,3})/);
+            targetItem.text
+          );
+
+        const standaloneSymbols = items.filter(item => DETECTION_PATTERNS.symbol.test(normalizeDetectionText(item.text)));
+        const nearbySymbols = standaloneSymbols.filter(sym => {
+          const xDiff = targetItem.x - sym.x; 
+          const yDiff = Math.abs(targetItem.y - sym.y);
+          return xDiff > -20 && xDiff < (targetItem.width || 30) * 3 && yDiff < 30;
+        });
+        
+        if (nearbySymbols.length > 0) {
+          text = normalizeDetectionText(nearbySymbols[0].text + text);
+        }
+
+        const match = text.match(/[+-]?\s*(0?\.\d{1,3})/);
 
         return match
           ? Number(match[1])
@@ -2429,7 +2455,14 @@ export default function DrawingWorkspace() {
       type = 'Radius';
     }
 
-    const value = cleanedValue;
+    let prefix = '';
+    const prefixMatch = text.match(/^\s*(Ø|R|SØ|SR|M|∅)/i);
+    if (prefixMatch) {
+      prefix = prefixMatch[1].toUpperCase();
+    }
+    const value = String(cleanedValue).toUpperCase().startsWith(prefix) 
+      ? cleanedValue 
+      : prefix + cleanedValue;
 
     const numericValue = Number(value);
     const plus = Number(plusTolerance);
@@ -2597,64 +2630,83 @@ export default function DrawingWorkspace() {
         sh
       );
 
-      if (!ocrWorkerRef.current) {
-        ocrWorkerRef.current = await createWorker('eng');
+      let words = [];
+      try {
+        const response = await api.post('/ocr/detect', {
+          imageBase64: crop.toDataURL('image/jpeg'),
+          isCrop: true
+        });
+        if (response.data && response.data.detections && response.data.detections.length > 0) {
+          words = response.data.detections.map(d => ({
+            text: d.text,
+            bbox: d.bbox,
+            confidence: d.confidence
+          }));
+        }
+      } catch (err) {
+        console.warn('Backend OCR failed, falling back to Tesseract...', err);
       }
-      let { data } = await ocrWorkerRef.current.recognize(crop);
-      let words = data.words.map(w => ({
-        text: w.text,
-        bbox: { x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 },
-        confidence: w.confidence
-      }));
 
-      const hasValidText = words.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')));
-      if (!hasValidText && words.length <= 2) {
-        // Try counter-clockwise rotation (bottom-to-top text)
-        const rotCanvas = document.createElement('canvas');
-        rotCanvas.width = crop.height;
-        rotCanvas.height = crop.width;
-        const rctx = rotCanvas.getContext('2d');
-        rctx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
-        rctx.rotate(-Math.PI / 2);
-        rctx.drawImage(crop, -crop.width / 2, -crop.height / 2);
-        
-        const { data: rotData } = await ocrWorkerRef.current.recognize(rotCanvas);
-        const rotWords = rotData.words.map(w => ({
+      if (words.length === 0) {
+        if (!ocrWorkerRef.current) {
+          ocrWorkerRef.current = await createWorker('eng');
+        }
+        let { data } = await ocrWorkerRef.current.recognize(crop);
+        words = data.words.map(w => ({
           text: w.text,
-          bbox: {
-            x0: crop.width - w.bbox.y1,
-            y0: w.bbox.x0,
-            x1: crop.width - w.bbox.y0,
-            y1: w.bbox.x1
-          },
+          bbox: { x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 },
           confidence: w.confidence
         }));
-        
-        if (rotWords.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')))) {
-          words = rotWords;
-        } else {
-          // Try clockwise rotation (top-to-bottom text)
-          const rotCanvas2 = document.createElement('canvas');
-          rotCanvas2.width = crop.height;
-          rotCanvas2.height = crop.width;
-          const rctx2 = rotCanvas2.getContext('2d');
-          rctx2.translate(rotCanvas2.width / 2, rotCanvas2.height / 2);
-          rctx2.rotate(Math.PI / 2);
-          rctx2.drawImage(crop, -crop.width / 2, -crop.height / 2);
+
+        const hasValidText = words.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')));
+        if (!hasValidText && words.length <= 2) {
+          // Try counter-clockwise rotation (bottom-to-top text)
+          const rotCanvas = document.createElement('canvas');
+          rotCanvas.width = crop.height;
+          rotCanvas.height = crop.width;
+          const rctx = rotCanvas.getContext('2d');
+          rctx.translate(rotCanvas.width / 2, rotCanvas.height / 2);
+          rctx.rotate(-Math.PI / 2);
+          rctx.drawImage(crop, -crop.width / 2, -crop.height / 2);
           
-          const { data: rotData2 } = await ocrWorkerRef.current.recognize(rotCanvas2);
-          const rotWords2 = rotData2.words.map(w => ({
+          const { data: rotData } = await ocrWorkerRef.current.recognize(rotCanvas);
+          const rotWords = rotData.words.map(w => ({
             text: w.text,
             bbox: {
-              x0: w.bbox.y0,
-              y0: crop.height - w.bbox.x1,
-              x1: w.bbox.y1,
-              y1: crop.height - w.bbox.x0
+              x0: crop.width - w.bbox.y1,
+              y0: w.bbox.x0,
+              x1: crop.width - w.bbox.y0,
+              y1: w.bbox.x1
             },
             confidence: w.confidence
           }));
-          if (rotWords2.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')))) {
-             words = rotWords2;
+          
+          if (rotWords.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')))) {
+            words = rotWords;
+          } else {
+            // Try clockwise rotation (top-to-bottom text)
+            const rotCanvas2 = document.createElement('canvas');
+            rotCanvas2.width = crop.height;
+            rotCanvas2.height = crop.width;
+            const rctx2 = rotCanvas2.getContext('2d');
+            rctx2.translate(rotCanvas2.width / 2, rotCanvas2.height / 2);
+            rctx2.rotate(Math.PI / 2);
+            rctx2.drawImage(crop, -crop.width / 2, -crop.height / 2);
+            
+            const { data: rotData2 } = await ocrWorkerRef.current.recognize(rotCanvas2);
+            const rotWords2 = rotData2.words.map(w => ({
+              text: w.text,
+              bbox: {
+                x0: w.bbox.y0,
+                y0: crop.height - w.bbox.x1,
+                x1: w.bbox.y1,
+                y1: crop.height - w.bbox.x0
+              },
+              confidence: w.confidence
+            }));
+            if (rotWords2.some(w => isDetectionText(normalizeDetectionText(w.text).replace(/O(?=\d)/gi, 'Ø').replace(/^0(?=\d)/, 'Ø')))) {
+               words = rotWords2;
+            }
           }
         }
       }
@@ -2785,11 +2837,29 @@ export default function DrawingWorkspace() {
       }
 
       if (target) {
-        return {
+        let pdfResult = {
           ...parseNearestDimension(items, target),
           source: 'pdf',
           confidence: 1
         };
+
+        // CAD PDFs often draw symbols (like Ø) as vector graphics while keeping the number as text.
+        // If the PDF result is a pure number without a symbol, let's run OCR to see if we missed a symbol!
+        if (/^\d+(?:\.\d+)?$/.test(pdfResult.value)) {
+          console.log("PDF text is a pure number. Running OCR to check for vector-drawn symbols...");
+          const ocrItems = await ocrReadRegion(rect);
+          if (ocrItems.length > 0) {
+            const ocrResult = parseNearestDimension(ocrItems, { x: rect.x1, y: rect.y1, width: rect.x2 - rect.x1, height: rect.y2 - rect.y1, text: '' });
+            // If OCR found a symbol like Ø13, use it!
+            if (ocrResult && ocrResult.value && !/^\d+(?:\.\d+)?$/.test(ocrResult.value)) {
+               pdfResult.value = ocrResult.value;
+               pdfResult.specification = ocrResult.specification || pdfResult.specification;
+               console.log("OCR rescued vector symbol:", ocrResult.value);
+            }
+          }
+        }
+
+        return pdfResult;
       }
     }
 
@@ -4634,8 +4704,14 @@ export default function DrawingWorkspace() {
           -------------------------------------------------------
         */
 
-        const value =
-          cleanedValue;
+        let prefix = '';
+        const prefixMatch = text.match(/^\s*(Ø|R|SØ|SR|M|∅)/i);
+        if (prefixMatch) {
+          prefix = prefixMatch[1].toUpperCase();
+        }
+        const value = String(cleanedValue).toUpperCase().startsWith(prefix)
+          ? cleanedValue
+          : prefix + cleanedValue;
 
         /*
           -------------------------------------------------------

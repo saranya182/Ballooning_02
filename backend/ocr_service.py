@@ -25,6 +25,7 @@ class OCRHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length)
             data = json.loads(body)
             image_base64 = data.get("imageBase64", "")
+            is_crop = data.get("isCrop", False)
 
             # Decode base64 image
             if image_base64.startswith("data:image"):
@@ -75,8 +76,8 @@ class OCRHandler(BaseHTTPRequestHandler):
                 x0_scaled = min(bbox[0][0], bbox[3][0])
                 y0_scaled = min(bbox[0][1], bbox[1][1])
                 
-                # Exclude Title Block and Margins
-                if (
+                # Exclude Title Block and Margins ONLY if it's a full page scan
+                if not is_crop and (
                     y0_scaled > title_block_y_threshold or
                     y0_scaled < margin_y_top or
                     x0_scaled < margin_x or
@@ -84,8 +85,8 @@ class OCRHandler(BaseHTTPRequestHandler):
                 ):
                     continue
                 
-                # Exclude pure noise (1 character that isn't a digit)
-                if len(text.strip()) <= 1 and not text.strip().isdigit():
+                # Exclude pure noise (1 character that isn't a digit) ONLY if full page
+                if not is_crop and len(text.strip()) <= 1 and not text.strip().isdigit():
                     continue
 
                 x0 = x0_scaled / scale
