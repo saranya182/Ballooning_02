@@ -61,7 +61,14 @@ class OCRHandler(BaseHTTPRequestHandler):
 
             # Run detection using the pre-loaded model. 
             # We must pass rotation_info to detect vertically rotated dimensions (90, 180, 270 degrees)
-            results = reader.readtext(img, rotation_info=[90, 180, 270])
+            # We lower text_threshold and link_threshold to force EasyOCR to pick up small/faint engineering symbols (like depth/diameter)
+            results = reader.readtext(
+                img, 
+                rotation_info=[90, 180, 270],
+                text_threshold=0.4,
+                low_text=0.3,
+                link_threshold=0.2
+            )
 
             detections = []
             
@@ -86,8 +93,17 @@ class OCRHandler(BaseHTTPRequestHandler):
                     continue
                 
                 # Exclude pure noise (1 character that isn't a digit) ONLY if full page
+                # but ALLOW characters that are often misread as shapes/symbols (v=depth, O/Q=diameter, R=radius, U=c-bore, etc)
                 if not is_crop and len(text.strip()) <= 1 and not text.strip().isdigit():
-                    continue
+                    char_upper = text.strip().upper()
+                    allowed_chars = {'V', 'O', 'Q', 'R', 'M', 'U', 'X', 'Y', 'Z', 'W'} 
+                    # Note: We don't exclude A-Z if it might be a datum, but limiting to common shapes reduces noise.
+                    if char_upper not in allowed_chars and not char_upper.isalpha():
+                        continue
+                    # Actually, if it's ANY letter, maybe it's a datum (A, B, C). Let's just allow all alphabet chars,
+                    # and only exclude punctuation/specks like '.', ',', '-', '~', etc.
+                    if not char_upper.isalpha():
+                        continue
 
                 x0 = x0_scaled / scale
                 y0 = y0_scaled / scale

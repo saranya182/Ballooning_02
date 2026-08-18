@@ -1,5 +1,8 @@
 {
-  "appId": "com.manufacturing.inspection",
-  "appName": "Manufacturing Inspection",
-  "webDir": "dist"
+  "appId": "com.manufacturing.ballooning",
+  "appName": "Ballooning",
+  "webDir": "dist",
+  "server": {
+    "cleartext": true
+  }
 }

@@ -21,6 +21,7 @@ import {
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createWorker } from 'tesseract.js';
+import * as XLSX from 'xlsx';
 
 import api from '../services/api';
 
@@ -38,7 +39,11 @@ const normalizeDetectionText = (value) => {
     .replace(/[＋]/g, '+')
     .replace(/[Øø]/g, 'Ø')
     .replace(/^[OQo0]\s*(?=\d)/i, 'Ø') // Converts Q19, O19, 019 to Ø19
-    .replace(/(\d),(\d)/g, '$1.$2');
+    .replace(/(?:^|\s)[vV]\s*(?=\d)/g, ' ↧ ') // Converts v 7 to ↧ 7 (depth)
+    .replace(/(?:^|\s)[uU]\s*(?=\d)/g, ' ⌴ ') // Converts U 14 to ⌴ 14 (counterbore)
+    .replace(/(?:^|\s)[xX]\s*(?=\d)/g, ' × ') // Multiplier
+    .replace(/(\d),(\d)/g, '$1.$2')
+    .replace(/\s+/g, ' ').trim();
 };
 
 const DETECTION_PATTERNS = {
@@ -49,7 +54,7 @@ const DETECTION_PATTERNS = {
   diameter: /^\s*Ø\s*\d+(?:\.\d+)?\s*$/i,
   radius: /^\s*R\s*\d+(?:\.\d+)?\s*$/i,
   dimension:
-    /^\s*\d{1,3}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches))?\s*$/i,
+    /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×)\s*)?\d{1,3}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches))?\s*$/i,
   smallTolerance: /^\s*[+-±]?\s*0?\.\d{1,3}\s*$/,
   fit:
     /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
@@ -62,7 +67,7 @@ const DETECTION_PATTERNS = {
   thread:
     /^\s*M\d+(?:\.\d+)?(?:\s*[x×]\s*\d+(?:\.\d+)?)?\s*$/i,
   datumFeature: /^\s*\d+(?:\.\d+)?\s*[A-Z]\s*$/,
-  symbol: /^\s*(Ø|R|SØ|SR|M|∅|Q|O|o|0)\s*$/i
+  symbol: /^\s*(Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|⌵|x)\s*$/i
 };
 
 const isDetectionText = (rawText) => {
@@ -350,23 +355,24 @@ const clusterDetectionsIntoDimensions = (detections) => {
       }
     }
 
+    // Append any other non-tolerance text in the same cluster (e.g. THRU ALL, ↧ 7, fits)
+    // so they are included in the same balloon specification.
+    const otherTextItems = sorted
+      .slice(1)
+      .filter((item) => !isToleranceLineText(item.text))
+      .sort((a, b) => clusterCenterY(a) - clusterCenterY(b));
+      
+    if (otherTextItems.length > 0) {
+      const otherText = otherTextItems
+        .map(item => normalizeDetectionText(item.text))
+        .join(' ');
+      combinedText = `${combinedText} ${otherText}`;
+    }
+
     result.push({
       ...primary,
       text: combinedText
     });
-
-    /*
-      Preserve any other non-tolerance detections in the
-      same cluster (e.g. a fit letter "H7" next to "16", the
-      zero line of a hole callout, or an angle) so they are
-      NOT swallowed by the merge.
-    */
-
-    for (const item of sorted.slice(1)) {
-      if (!isToleranceLineText(item.text)) {
-        result.push(item);
-      }
-    }
   }
 
   return result;
@@ -439,9 +445,21 @@ export default function DrawingWorkspace() {
   // Editable right-panel balloon form
   const [currentBalloonNo, setCurrentBalloonNo] = useState('');
   const [editData, setEditData] = useState(null);
+  const [focusedField, setFocusedField] = useState('specification');
 
-  const apiBase =
-    import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+  const insertSymbol = (sym) => {
+    if (focusedField === 'currentBalloonNo') {
+      setCurrentBalloonNo(prev => prev + sym);
+      return;
+    }
+    if (!editData) return;
+    setEditData((prev) => prev ? {
+      ...prev,
+      [focusedField]: (prev[focusedField] || '') + sym
+    } : prev);
+  };
+
+  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
 
   const backendBase = apiBase.replace(/\/api\/?$/, '');
 
@@ -773,26 +791,6 @@ export default function DrawingWorkspace() {
 
     pdfPage.render(renderContext);
   }, [pdfPage, zoom]);
-
-/* =========================================================
-      SAVE PROJECT
-  ========================================================= */
-
-  const saveProject = async () => {
-    try {
-      setMessage('Saving...');
-
-      await api.put(`/projects/${id}`, {
-        status: 'Draft'
-      });
-
-      setMessage('Saved successfully');
-    } catch (error) {
-      setMessage(
-        error.message || 'Save failed'
-      );
-    }
-  };
 
 /* =========================================================
       DOWNLOAD PDF WITH BALLOONS
@@ -1748,7 +1746,8 @@ export default function DrawingWorkspace() {
     try {
       setSavingCharacteristicId(editData.characteristicId);
 
-      const number = Number(editData.number);
+      const number = Number(currentBalloonNo || editData.number);
+      setEditData(prev => ({ ...prev, number: String(number) }));
 
       const updated = await api.put(
         `/characteristics/${editData.characteristicId}`,
@@ -1798,9 +1797,31 @@ export default function DrawingWorkspace() {
   useEffect(() => {
     if (selectedBalloonId) {
       syncEditFromBalloon(selectedBalloonId);
+    } else {
+      setCurrentBalloonNo('');
+      setEditData(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedBalloonId]);
+  }, [selectedBalloonId, characteristics]);
+
+  const exportToExcel = () => {
+    const data = characteristics
+      .slice()
+      .sort((a, b) => Number(a.number || 0) - Number(b.number || 0))
+      .map(c => ({
+        'Balloon No': c.number || '',
+        'Description': c.specification || '',
+        'Dimension No (mm)': c.value || '',
+        'Upper Tolerance (+) mm': c.plusTolerance || '',
+        'Lower Tolerance (-) mm': c.minusTolerance || ''
+      }));
+
+    const worksheet = XLSX.utils.json_to_sheet(data);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Characteristics');
+    
+    // Name the file based on the project ID or just generic name
+    XLSX.writeFile(workbook, `Ballooning_Report_${id || 'Export'}.xlsx`);
+  };
 
   /* =========================================================
      DRAG BALLOON
@@ -2296,7 +2317,7 @@ export default function DrawingWorkspace() {
     ) {
       const firstNumber =
         text.match(
-          /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)/
+          /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×)\s*)?(\d+(?:\.\d+)?)/
         );
 
       if (firstNumber) {
@@ -2485,14 +2506,16 @@ export default function DrawingWorkspace() {
 
     let specification = text;
 
-    if (
-      plusTolerance !== '0.00' ||
-      minusTolerance !== '0.00'
-    ) {
-      specification =
-        plusTolerance === minusTolerance
-          ? `${value} ±${plusTolerance}`
-          : `${value} +${plusTolerance}/-${minusTolerance}`;
+    if (!plusMinusMatch && !bilateralMatch) {
+      if (
+        plusTolerance !== '0.00' ||
+        minusTolerance !== '0.00'
+      ) {
+        specification =
+          plusTolerance === minusTolerance
+            ? `${text} ±${plusTolerance}`
+            : `${text} +${plusTolerance}/-${minusTolerance}`;
+      }
     }
 
     return {
@@ -2849,12 +2872,15 @@ export default function DrawingWorkspace() {
           console.log("PDF text is a pure number. Running OCR to check for vector-drawn symbols...");
           const ocrItems = await ocrReadRegion(rect);
           if (ocrItems.length > 0) {
-            const ocrResult = parseNearestDimension(ocrItems, { x: rect.x1, y: rect.y1, width: rect.x2 - rect.x1, height: rect.y2 - rect.y1, text: '' });
-            // If OCR found a symbol like Ø13, use it!
-            if (ocrResult && ocrResult.value && !/^\d+(?:\.\d+)?$/.test(ocrResult.value)) {
-               pdfResult.value = ocrResult.value;
-               pdfResult.specification = ocrResult.specification || pdfResult.specification;
-               console.log("OCR rescued vector symbol:", ocrResult.value);
+            const ocrTarget = findNearestDimension(ocrItems, centerX, centerY, 70);
+            if (ocrTarget) {
+              const ocrResult = parseNearestDimension(ocrItems, ocrTarget);
+              // If OCR found a symbol like Ø13, use it!
+              if (ocrResult && ocrResult.value && !/^\d+(?:\.\d+)?$/.test(ocrResult.value)) {
+                 pdfResult.value = ocrResult.value;
+                 pdfResult.specification = ocrResult.specification || pdfResult.specification;
+                 console.log("OCR rescued vector symbol:", ocrResult.value);
+              }
             }
           }
         }
@@ -4426,7 +4452,7 @@ export default function DrawingWorkspace() {
         ) {
           const firstNumber =
             text.match(
-              /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)/
+              /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×)\s*)?(\d+(?:\.\d+)?)/
             );
 
           if (firstNumber) {
@@ -5390,18 +5416,6 @@ export default function DrawingWorkspace() {
             Clear All Ballooning
           </button>
 
-          {/* SAVE */}
-
-          <button
-            className="rounded border px-3 py-2 text-sm"
-            onClick={saveProject}
-          >
-            <Save
-              size={15}
-              className="inline mr-1"
-            />
-            Save
-          </button>
 
 
           {/* DOWNLOAD PDF */}
@@ -6114,16 +6128,31 @@ export default function DrawingWorkspace() {
               <input
                 type="text"
                 value={currentBalloonNo}
+                onFocus={() => setFocusedField('currentBalloonNo')}
                 onChange={(e) =>
                   handleBalloonNumberChange(e.target.value)
                 }
                 onKeyDown={handleBalloonNumberKeyDown}
+                onBlur={saveEdit}
                 placeholder="Enter balloon number"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
             </div>
 
             <div>
+              <div className="mb-2 flex flex-wrap gap-1">
+                {['Ø', 'R', '↧', '⌴', '⌵', '°', '±', '×', 'Ⓜ', 'Ⓛ', '⟂', '∥', '∠', '⌖', '◯', '▱'].map(sym => (
+                  <button
+                    key={sym}
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => insertSymbol(sym)}
+                    className="rounded border border-slate-300 bg-slate-50 px-2 py-1 text-xs text-slate-700 hover:bg-slate-200"
+                  >
+                    {sym}
+                  </button>
+                ))}
+              </div>
               <label className="mb-1 block text-xs font-medium text-slate-600">
                 Description
               </label>
@@ -6131,6 +6160,7 @@ export default function DrawingWorkspace() {
               <input
                 type="text"
                 value={editData?.specification ?? ''}
+                onFocus={() => setFocusedField('specification')}
                 onChange={(e) =>
                   setEditData((prev) =>
                     prev
@@ -6141,6 +6171,7 @@ export default function DrawingWorkspace() {
                       : prev
                   )
                 }
+                onBlur={saveEdit}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -6154,6 +6185,7 @@ export default function DrawingWorkspace() {
               <input
                 type="text"
                 value={editData?.value ?? ''}
+                onFocus={() => setFocusedField('value')}
                 onChange={(e) =>
                   setEditData((prev) =>
                     prev
@@ -6164,6 +6196,7 @@ export default function DrawingWorkspace() {
                       : prev
                   )
                 }
+                onBlur={saveEdit}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -6177,6 +6210,7 @@ export default function DrawingWorkspace() {
               <input
                 type="text"
                 value={editData?.plusTolerance ?? ''}
+                onFocus={() => setFocusedField('plusTolerance')}
                 onChange={(e) =>
                   setEditData((prev) =>
                     prev
@@ -6187,6 +6221,7 @@ export default function DrawingWorkspace() {
                       : prev
                   )
                 }
+                onBlur={saveEdit}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -6200,6 +6235,7 @@ export default function DrawingWorkspace() {
               <input
                 type="text"
                 value={editData?.minusTolerance ?? ''}
+                onFocus={() => setFocusedField('minusTolerance')}
                 onChange={(e) =>
                   setEditData((prev) =>
                     prev
@@ -6210,6 +6246,7 @@ export default function DrawingWorkspace() {
                       : prev
                   )
                 }
+                onBlur={saveEdit}
                 placeholder="—"
                 className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
               />
@@ -6317,15 +6354,25 @@ export default function DrawingWorkspace() {
                   Ballooning Table
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() =>
-                    setShowCharacteristicsTable(false)
-                  }
-                  className="rounded border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
-                >
-                  Close
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={exportToExcel}
+                    className="flex items-center gap-2 rounded bg-green-600 px-3 py-2 text-sm text-white hover:bg-green-700"
+                  >
+                    <Download size={14} />
+                    Download Excel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setShowCharacteristicsTable(false)
+                    }
+                    className="rounded border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+                  >
+                    Close
+                  </button>
+                </div>
 
               </div>
 
