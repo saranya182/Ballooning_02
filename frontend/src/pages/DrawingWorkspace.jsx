@@ -48,16 +48,16 @@ const normalizeDetectionText = (value) => {
 
 const DETECTION_PATTERNS = {
   tolerance:
-    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*$/i,
+    /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*\d+(?:\.\d+)?\s*(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?\s*(?:THRU|ALL|DP|DEEP|TYP|PLACES|MAX|MIN)*\s*$/i,
   bilateral:
-    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*$/i,
-  diameter: /^\s*Ø\s*\d+(?:\.\d+)?\s*$/i,
-  radius: /^\s*R\s*\d+(?:\.\d+)?\s*$/i,
+    /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*(?:\/|\s)\s*[-−]\s*\d+(?:\.\d+)?\s*(?:THRU|ALL|DP|DEEP|TYP|PLACES|MAX|MIN)*\s*$/i,
+  diameter: /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*Ø\s*\d+(?:\.\d+)?\s*$/i,
+  radius: /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*R\s*\d+(?:\.\d+)?\s*$/i,
   dimension:
-    /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×)\s*)?\d{1,3}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches))?\s*$/i,
+    /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*\d{1,4}(?:\.\d{1,4})?(?:\s*(?:mm|in|inch|inches|THRU|ALL|DP|DEEP|TYP|PLACES|MAX|MIN|REF))*\s*$/i,
   smallTolerance: /^\s*[+-±]?\s*0?\.\d{1,3}\s*$/,
   fit:
-    /^\s*(?:Ø\s*)?\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
+    /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*$/i,
   angle: /^\s*\d+(?:\.\d+)?\s*°\s*$/,
   angleTolerance:
     /^\s*\d+(?:\.\d+)?\s*°\s*±\s*\d+(?:\.\d+)?\s*$/,
@@ -2317,7 +2317,7 @@ export default function DrawingWorkspace() {
     ) {
       const firstNumber =
         text.match(
-          /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×)\s*)?(\d+(?:\.\d+)?)/
+          /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*(\d+(?:\.\d+)?)/
         );
 
       if (firstNumber) {
@@ -3710,9 +3710,10 @@ export default function DrawingWorkspace() {
           const text =
             normalizeText(item.str);
 
-          const passes = isCharacteristicText(text);
+          // Only filter out pure text blocks without numbers
+          const passes = /\d/.test(text);
           if (!passes) {
-            console.log('REJECTED:', JSON.stringify(text));
+            console.log('REJECTED (no digits):', JSON.stringify(text));
             continue;
           }
 
@@ -3733,34 +3734,6 @@ export default function DrawingWorkspace() {
 
           const y =
             point[1] * displayScale;
-
-          /*
-            Ignore outer margins (top, left, right 5%) and the large bottom title block (bottom 25%).
-          */
-
-          if (
-            point[1] > baseViewport.height * 0.75 || // Bottom 25% (Title Block)
-            point[1] < baseViewport.height * 0.05 || // Top 5% margin
-            point[0] < baseViewport.width * 0.05 ||  // Left 5% margin
-            point[0] > baseViewport.width * 0.95     // Right 5% margin
-          ) {
-            console.log('REJECTED (outside drawing area):', JSON.stringify(text));
-            continue;
-          }
-
-          /*
-            Ignore top-right revision area.
-          */
-
-          if (
-            point[0] >
-            baseViewport.width * 0.68 &&
-            point[1] <
-            baseViewport.height * 0.12
-          ) {
-            console.log('REJECTED (revision area):', JSON.stringify(text));
-            continue;
-          }
 
           console.log('ACCEPTED:', JSON.stringify(text), 'at', Math.round(x), Math.round(y));
 
@@ -4452,7 +4425,7 @@ export default function DrawingWorkspace() {
         ) {
           const firstNumber =
             text.match(
-              /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×)\s*)?(\d+(?:\.\d+)?)/
+              /^\s*(?:(?:Ø|R|SØ|SR|M|∅|Q|O|o|0|↧|v|V|⌴|U|u|⌵|x|X|×|\d+\s*[xX×])\s*)*(\d+(?:\.\d+)?)/
             );
 
           if (firstNumber) {

@@ -1,0 +1,15 @@
+{
+  "name": "ballooning-app",
+  "version": "1.0.0",
+  "description": "Run frontend, backend, and OCR service together",
+  "scripts": {
+    "start": "concurrently -c \"cyan,yellow,magenta\" -n \"backend,ocr,frontend\" \"npm run start-backend\" \"npm run start-ocr\" \"npm run start-frontend\"",
+    "start-backend": "cd backend && npm run start",
+    "start-ocr": "cd backend && python ocr_service.py",
+    "start-frontend": "cd frontend && npm run dev",
+    "install-all": "npm install && cd backend && npm install && cd ../frontend && npm install"
+  },
+  "dependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

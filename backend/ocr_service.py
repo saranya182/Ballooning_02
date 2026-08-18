@@ -61,36 +61,17 @@ class OCRHandler(BaseHTTPRequestHandler):
 
             # Run detection using the pre-loaded model. 
             # We must pass rotation_info to detect vertically rotated dimensions (90, 180, 270 degrees)
-            # We lower text_threshold and link_threshold to force EasyOCR to pick up small/faint engineering symbols (like depth/diameter)
             results = reader.readtext(
                 img, 
-                rotation_info=[90, 180, 270],
-                text_threshold=0.4,
-                low_text=0.3,
-                link_threshold=0.2
+                rotation_info=[90, 180, 270]
             )
 
             detections = []
             
-            # Define drawing area boundaries (Exclude outer 5% margin and bottom 25% title block)
-            margin_x = w * 0.05 * scale
-            margin_y_top = h * 0.05 * scale
-            title_block_y_threshold = h * 0.75 * scale
-            right_margin_x = w * 0.95 * scale
-
             for (bbox, text, prob) in results:
                 # Scale bounding boxes back up to original image coordinates
                 x0_scaled = min(bbox[0][0], bbox[3][0])
                 y0_scaled = min(bbox[0][1], bbox[1][1])
-                
-                # Exclude Title Block and Margins ONLY if it's a full page scan
-                if not is_crop and (
-                    y0_scaled > title_block_y_threshold or
-                    y0_scaled < margin_y_top or
-                    x0_scaled < margin_x or
-                    x0_scaled > right_margin_x
-                ):
-                    continue
                 
                 # Exclude pure noise (1 character that isn't a digit) ONLY if full page
                 # but ALLOW characters that are often misread as shapes/symbols (v=depth, O/Q=diameter, R=radius, U=c-bore, etc)
