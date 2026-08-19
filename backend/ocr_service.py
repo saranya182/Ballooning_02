@@ -53,10 +53,10 @@ class OCRHandler(BaseHTTPRequestHandler):
             pass
 
             # Run detection using the pre-loaded model. 
-            # Restored rotation_info to accurately detect vertical dimensions like 10 and 16 ±0.02
+            # Only use 90 degrees (vertical text) instead of 180/270 to double the speed!
             results = reader.readtext(
                 img,
-                rotation_info=[90, 180, 270]
+                rotation_info=[90]
             )
 
             detections = []
