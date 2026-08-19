@@ -3777,9 +3777,9 @@ export default function DrawingWorkspace() {
       const uniqueDetected = cleanAndGroupDetections(detected);
       let finalDetected = uniqueDetected;
 
-      // ALWAYS run OCR to catch vector dimensions
-      if (true) {
-        setMessage('Running deep-learning OCR for accurate detection (this takes ~15 seconds, please wait)...');
+      // Only run OCR if absolutely necessary (e.g. garbled PDF) to keep it instant
+      if (finalDetected.length === 0) {
+        setMessage('Running deep-learning OCR for accurate detection...');
 
         try {
           const ocrScale = 1.5;
