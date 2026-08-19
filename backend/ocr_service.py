@@ -49,20 +49,14 @@ class OCRHandler(BaseHTTPRequestHandler):
                 new_h = int(h * scale)
                 img = cv2.resize(img, (new_w, new_h))
 
-            # Apply Image Processing Filters for Unclear Drawings
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # CLAHE (Contrast Limited Adaptive Histogram Equalization) is safe and effective
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-
-            # Use the enhanced image for OCR
-            img = enhanced
+            # Skipped CLAHE to prevent washing out very thin lines since JS already boosts contrast
+            pass
 
             # Run detection using the pre-loaded model. 
-            # Removed rotation_info to make it 4x FASTER (3 seconds instead of 15 seconds).
+            # Restored rotation_info to accurately detect vertical dimensions like 10 and 16 ±0.02
             results = reader.readtext(
-                img
+                img,
+                rotation_info=[90, 180, 270]
             )
 
             detections = []

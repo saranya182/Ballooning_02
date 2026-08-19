@@ -2152,17 +2152,15 @@ export default function DrawingWorkspace() {
       // Ignore title block
       if (
         point[1] >
-        baseViewport.height * 0.87
+        baseViewport.height * 0.80
       ) {
         continue;
       }
 
-      // Ignore top-right revision area
+      // Ignore top-right revision area and right margins
       if (
-        point[0] >
-        baseViewport.width * 0.68 &&
-        point[1] <
-        baseViewport.height * 0.12
+        point[0] > baseViewport.width * 0.90 || 
+        (point[0] > baseViewport.width * 0.60 && point[1] < baseViewport.height * 0.15)
       ) {
         continue;
       }
@@ -3943,9 +3941,10 @@ export default function DrawingWorkspace() {
             const pageY =
               ocrY / ocrScale;
 
+            // Exclude bottom 20% for large title blocks
             if (
               pageY >
-              baseViewport.height * 0.87
+              baseViewport.height * 0.80
             ) {
               continue;
             }
@@ -3953,11 +3952,11 @@ export default function DrawingWorkspace() {
             const pageX =
               ocrX / ocrScale;
 
+            // Exclude right-side margins more aggressively
             if (
               pageX >
-              baseViewport.width * 0.68 &&
-              pageY <
-              baseViewport.height * 0.12
+              baseViewport.width * 0.90 || 
+              (pageX > baseViewport.width * 0.60 && pageY < baseViewport.height * 0.15)
             ) {
               continue;
             }
