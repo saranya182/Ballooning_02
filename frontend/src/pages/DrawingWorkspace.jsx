@@ -3154,8 +3154,8 @@ export default function DrawingWorkspace() {
       const value = normalize(text);
 
       return (
-        /^±\s*\d+(?:\.\d+)?$/i.test(value) ||
-        /^[+]\s*\d+(?:\.\d+)?\s*\/\s*[-]\s*\d+(?:\.\d+)?$/i.test(value) ||
+        /^(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?$/i.test(value) ||
+        /^[+]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?$/i.test(value) ||
         /^[+-]?\s*0?\.\d{1,3}$/i.test(value)
       );
     };
@@ -3164,8 +3164,8 @@ export default function DrawingWorkspace() {
       const value = normalize(text);
 
       return (
-        /^\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?$/i.test(value) ||
-        /^\d+(?:\.\d+)?\s*[+]\s*\d+(?:\.\d+)?\s*\/\s*[-]\s*\d+(?:\.\d+)?$/i.test(value)
+        /^\d+(?:\.\d+)?\s*(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?$/i.test(value) ||
+        /^\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?$/i.test(value)
       );
     };
 
@@ -3495,7 +3495,7 @@ export default function DrawingWorkspace() {
       ========================================================= */
 
       const tolerancePattern =
-        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const bilateralTolerancePattern =
         /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
@@ -3513,7 +3513,7 @@ export default function DrawingWorkspace() {
         /^\s*(?:\d+[Xx*]\s*)?\d+(?:\.\d+)?(?:\s*(?:mm|in|inch|inches))?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const fitPattern =
-        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[A-Za-z]{1,2}\d{1,2}(?:\s*\/\s*[A-Za-z]{1,2}\d{1,2})?(?:\s*(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?)?(?:\s*[+＋]\s*\d+(?:\.\d+)?\s*\/?\s*[-−]?\s*\d+(?:\.\d+)?)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const anglePattern =
         /^\s*(?:\d+[Xx*]\s*)?\d+(?:\.\d+)?\s*°\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
@@ -3765,28 +3765,13 @@ export default function DrawingWorkspace() {
 
       console.log('Total ACCEPTED before dedup:', detected.length);
 
-      const uniqueDetected =
-        cleanAndGroupDetections(
-          detected
-        );
-
-      console.log('Total after cleanAndGroupDetections:', uniqueDetected.length);
-
       /* =========================================================
-         7. OCR FALLBACK (also used when PDF text is garbled)
+         7. OCR FALLBACK (always runs now)
       ========================================================= */
 
-      let finalDetected =
-        uniqueDetected;
-
-      if (
-        finalDetected.length === 0
-      ) {
-        setMessage(
-          isGarbledPDF
-            ? 'PDF uses custom font encoding. Running deep-learning OCR for accurate detection...'
-            : 'No selectable dimensions found. OCR is reading the drawing...'
-        );
+      // ALWAYS run OCR to catch vectors that PDF.js misses
+      if (true) {
+        setMessage('Running deep-learning OCR for accurate detection...');
 
         try {
           const ocrScale = 1.5;
@@ -3838,11 +3823,15 @@ export default function DrawingWorkspace() {
               ocrViewport
           }).promise;
 
-          if (!ocrWorkerRef.current) {
-            ocrWorkerRef.current = await createWorker('eng');
-          }
-          const { data } = await ocrWorkerRef.current.recognize(ocrCanvas);
-          let words = data.words.map(w => ({
+          // Use the high-accuracy EasyOCR python backend instead of Tesseract!
+          const imageBase64 = ocrCanvas.toDataURL('image/jpeg', 0.8);
+          const response = await fetch('/api/ocr', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ imageBase64, isCrop: false })
+          });
+          const ocrData = await response.json();
+          let words = (ocrData.detections || []).map(w => ({
             text: w.text,
             bbox: {
               x0: w.bbox.x0,
@@ -3850,7 +3839,7 @@ export default function DrawingWorkspace() {
               x1: w.bbox.x1,
               y1: w.bbox.y1
             },
-            confidence: w.confidence
+            confidence: w.confidence || 100
           }));
 
           // Phase 3: Spatial Clustering
@@ -3924,9 +3913,7 @@ export default function DrawingWorkspace() {
                 );
 
             if (
-              !isCharacteristicText(
-                text
-              )
+              !/\d/.test(text)
             ) {
               continue;
             }
