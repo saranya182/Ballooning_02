@@ -3769,9 +3769,9 @@ export default function DrawingWorkspace() {
          7. OCR FALLBACK (always runs now)
       ========================================================= */
 
-      // ALWAYS run OCR to catch vectors that PDF.js misses
-      if (true) {
-        setMessage('Running deep-learning OCR for accurate detection...');
+      // Only run OCR if no dimensions were found (or if garbled)
+      if (finalDetected.length === 0) {
+        setMessage(isGarbledPDF ? 'PDF uses custom font encoding. Running deep-learning OCR for accurate detection...' : 'No selectable dimensions found. OCR is reading the drawing...');
 
         try {
           const ocrScale = 1.5;
