@@ -3825,7 +3825,7 @@ export default function DrawingWorkspace() {
 
           // Use the high-accuracy EasyOCR python backend instead of Tesseract!
           const imageBase64 = ocrCanvas.toDataURL('image/jpeg', 0.8);
-          const response = await fetch('/api/ocr', {
+          const response = await fetch('/api/ocr/detect', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ imageBase64, isCrop: false })
