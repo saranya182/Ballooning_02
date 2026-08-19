@@ -3830,18 +3830,13 @@ export default function DrawingWorkspace() {
           }).promise;
 
           // Use the high-accuracy EasyOCR python backend instead of Tesseract!
-          // Use preloaded cache if available for instant detection!
-          let ocrData = ocrCacheRef.current[pageNumber];
-          if (!ocrData) {
-            const imageBase64 = ocrCanvas.toDataURL('image/jpeg', 0.8);
-            const response = await fetch('/api/ocr/detect', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ imageBase64, isCrop: false })
-            });
-            ocrData = await response.json();
-            ocrCacheRef.current[pageNumber] = ocrData;
-          }
+          const imageBase64 = ocrCanvas.toDataURL('image/jpeg', 0.8);
+          const response = await fetch('/api/ocr/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ imageBase64, isCrop: false })
+          });
+          const ocrData = await response.json();
           let words = (ocrData.detections || []).map(w => ({
             text: w.text,
             bbox: {
