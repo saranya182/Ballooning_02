@@ -2248,7 +2248,7 @@ export default function DrawingWorkspace() {
 
     const plusMinusMatch =
       text.match(
-        /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)\s*±\s*(\d+(?:\.\d+)?)/i
+        /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)\s*(?:±|\+\/-|\+-|\+\s*-)\s*(\d+(?:\.\d+)?)/i
       );
 
     const bilateralMatch =
@@ -4323,7 +4323,7 @@ export default function DrawingWorkspace() {
 
         const plusMinusMatch =
           text.match(
-            /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)\s*±\s*(\d+(?:\.\d+)?)/i
+            /^\s*(?:A~\s*|Ø\s*)?(\d+(?:\.\d+)?)\s*(?:A|±|\+\/-|\+ -)\s*(\d+(?:\.\d+)?)/i
           );
 
         const bilateralMatch =
