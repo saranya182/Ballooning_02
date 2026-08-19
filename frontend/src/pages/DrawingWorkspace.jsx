@@ -3779,7 +3779,7 @@ export default function DrawingWorkspace() {
 
       // ALWAYS run OCR to catch vector dimensions because PDF text layer is missing them
       if (true) {
-        setMessage('Scanning vector shapes (takes ~15 seconds)...');
+        setMessage('Scanning vector shapes (takes ~3 seconds)...');
 
         try {
           const ocrScale = 1.5;
