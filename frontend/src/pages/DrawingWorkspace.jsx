@@ -2253,12 +2253,12 @@ export default function DrawingWorkspace() {
 
     const plusMinusMatch =
       text.match(
-        /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)\s*(?:±|\+\/-|\+-|\+\s*-)\s*(\d+(?:\.\d+)?)/i
+        /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)(?:\s*[A-Za-z0-9]+)*\s*(?:±|\+\/-|\+-|\+\s*-)\s*(\d+(?:\.\d+)?)/i
       );
 
     const bilateralMatch =
       text.match(
-        /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)\s*\+(\d+(?:\.\d+)?)\s*\/\s*-(\d+(?:\.\d+)?)/i
+        /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)(?:\s*[A-Za-z0-9]+)*\s*\+(\d+(?:\.\d+)?)\s*\/\s*-(\d+(?:\.\d+)?)/i
       );
 
     if (plusMinusMatch) {
@@ -3500,10 +3500,10 @@ export default function DrawingWorkspace() {
       ========================================================= */
 
       const tolerancePattern =
-        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?(?:\s*[A-Za-z0-9]+)*\s*(?:±|\+\/-|\+-|\+\s*-)\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const bilateralTolerancePattern =
-        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
+        /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?(?:\s*[A-Za-z0-9]+)*\s*[+＋]\s*\d+(?:\.\d+)?\s*\/\s*[-−]\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
 
       const unilateralTolerancePattern =
         /^\s*(?:\d+[Xx*]\s*)?(?:Ø\s*)?\d+(?:\.\d+)?\s*[+＋\-−]\s*\d+(?:\.\d+)?\s*(?:THRU|TYP|REF|BSC|DP|MAX|MIN|C\/BORE|C\/SINK|DEEP|HOLES|PLACES|PLCS|\(.*?\))*\s*$/i;
@@ -3779,10 +3779,10 @@ export default function DrawingWorkspace() {
 
       // ALWAYS run OCR to catch vector dimensions
       if (true) {
-        setMessage('Running deep-learning OCR for accurate detection (this takes ~10 seconds)...');
+        setMessage('Running deep-learning OCR for accurate detection (this takes ~15 seconds, please wait)...');
 
         try {
-          const ocrScale = 1.0;
+          const ocrScale = 1.5;
 
           const ocrViewport =
             pdfPage.getViewport({
@@ -4318,12 +4318,12 @@ export default function DrawingWorkspace() {
 
         const plusMinusMatch =
           text.match(
-            /^\s*(?:A~\s*|Ø\s*)?(\d+(?:\.\d+)?)\s*(?:A|±|\+\/-|\+ -)\s*(\d+(?:\.\d+)?)/i
+            /^\s*(?:A~\s*|Ø\s*)?(\d+(?:\.\d+)?)(?:\s*[A-Za-z0-9]+)*\s*(?:A|±|\+\/-|\+ -)\s*(\d+(?:\.\d+)?)/i
           );
 
         const bilateralMatch =
           text.match(
-            /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)\s*\+(\d+(?:\.\d+)?)\s*\/\s*-(\d+(?:\.\d+)?)/i
+            /^\s*(?:Ø\s*)?(\d+(?:\.\d+)?)(?:\s*[A-Za-z0-9]+)*\s*\+(\d+(?:\.\d+)?)\s*\/\s*-(\d+(?:\.\d+)?)/i
           );
 
         if (
