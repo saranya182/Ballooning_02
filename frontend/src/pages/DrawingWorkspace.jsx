@@ -3769,6 +3769,7 @@ export default function DrawingWorkspace() {
          7. OCR FALLBACK
       ========================================================= */
       
+      const uniqueDetected = cleanAndGroupDetections(detected);
       let finalDetected = uniqueDetected;
 
       // Only run OCR if no dimensions were found (or if garbled)
