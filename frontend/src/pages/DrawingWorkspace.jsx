@@ -1840,7 +1840,9 @@ export default function DrawingWorkspace() {
     dragBalloonRef.current = {
       balloonId: balloon._id,
       lastX: event.clientX,
-      lastY: event.clientY
+      lastY: event.clientY,
+      initialX: event.clientX,
+      initialY: event.clientY
     };
 
     event.currentTarget.setPointerCapture?.(
@@ -1904,6 +1906,9 @@ export default function DrawingWorkspace() {
         );
 
       if (!balloon) return;
+      
+      const movedDistance = Math.hypot(event.clientX - drag.initialX, event.clientY - drag.initialY);
+      if (movedDistance < 5) return; // Didn't actually drag, just clicked
 
       try {
         /*
@@ -3772,12 +3777,12 @@ export default function DrawingWorkspace() {
       const uniqueDetected = cleanAndGroupDetections(detected);
       let finalDetected = uniqueDetected;
 
-      // Only run OCR if no dimensions were found (or if garbled)
-      if (finalDetected.length === 0) {
-        setMessage(isGarbledPDF ? 'PDF uses custom font encoding. Running deep-learning OCR for accurate detection...' : 'No selectable dimensions found. OCR is reading the drawing...');
+      // ALWAYS run OCR to catch vector dimensions
+      if (true) {
+        setMessage('Running deep-learning OCR for accurate detection (this takes ~10 seconds)...');
 
         try {
-          const ocrScale = 1.5;
+          const ocrScale = 1.0;
 
           const ocrViewport =
             pdfPage.getViewport({
