@@ -3766,8 +3766,10 @@ export default function DrawingWorkspace() {
       console.log('Total ACCEPTED before dedup:', detected.length);
 
       /* =========================================================
-         7. OCR FALLBACK (always runs now)
+         7. OCR FALLBACK
       ========================================================= */
+      
+      let finalDetected = uniqueDetected;
 
       // Only run OCR if no dimensions were found (or if garbled)
       if (finalDetected.length === 0) {
